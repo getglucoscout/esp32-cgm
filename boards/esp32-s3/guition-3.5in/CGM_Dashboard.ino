@@ -25,6 +25,17 @@
 
 Preferences prefs;
 
+// Route JSON documents to PSRAM (8MB) instead of the scarce, fragmentation-prone
+// internal heap. Repeated TLS + JSON churn fragments internal RAM over hours until
+// the largest contiguous block can't fit the next SSL/JSON alloc (see loop() heap
+// log) — the classic "crashes after N hours". PSRAM removes that pressure. (ArduinoJson v7)
+struct PsramAllocator : ArduinoJson::Allocator {
+    void* allocate(size_t n) override            { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
+    void  deallocate(void* p) override           { heap_caps_free(p); }
+    void* reallocate(void* p, size_t n) override { return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM); }
+};
+static PsramAllocator g_psram;
+
 #define NS_UPDATE_MS        60000UL
 #define WEATHER_UPDATE_MS   (5 * 60000UL)
 #define GMI_UPDATE_MS       (60UL * 60000UL)   // est-A1C (GMI) recompute hourly
@@ -251,8 +262,8 @@ void fetchNightscout(){
     h.begin(c,nsUrl()+"/api/v1/entries.json?count=36");
     h.addHeader("API-SECRET",sha1Hex(nsSecret().c_str()));h.setTimeout(10000);
     if(h.GET()==200){
-        DynamicJsonDocument doc(16384);
-        if(deserializeJson(doc,h.getString())==DeserializationError::Ok){
+        JsonDocument doc(&g_psram);
+        if(deserializeJson(doc,h.getStream())==DeserializationError::Ok){  // stream-parse: no big internal String
             int v=doc[0]["sgv"].as<int>();
             String tr=trendToArrow(doc[0]["direction"].as<String>());
             int d=(doc.size()>=2)?v-doc[1]["sgv"].as<int>():0;
@@ -298,8 +309,8 @@ void fetchWeather(){
              +"&timezone=auto&forecast_days=5");
     h.setTimeout(10000);
     if(h.GET()==200){
-        DynamicJsonDocument doc(8192);
-        if(deserializeJson(doc,h.getString())==DeserializationError::Ok){
+        JsonDocument doc(&g_psram);
+        if(deserializeJson(doc,h.getStream())==DeserializationError::Ok){  // stream-parse: no big internal String
             String suffix=cfg.isCelsius?"C":"F";
             String w=String((int)doc["current"]["temperature_2m"].as<float>())
                     +suffix+"  "+wxDesc(doc["current"]["weather_code"].as<int>());
@@ -421,14 +432,14 @@ bool dexcomLogin(){
     String body="{\"accountName\":\""+cfg.dexUser+"\",\"password\":\""+cfg.dexPass+"\",\"applicationId\":\""+String(DEX_APPID)+"\"}";
     String resp;
     if(httpJson("POST",url,body,nullptr,nullptr,&resp)!=200)return false;
-    DynamicJsonDocument d(256);
+    JsonDocument d(&g_psram);
     if(deserializeJson(d,resp)!=DeserializationError::Ok)return false;
     String acct=d.as<String>();
     if(acct.length()==0||acct=="null")return false;
     url="https://"+dexHost()+"/ShareWebServices/Services/General/LoginPublisherAccountById";
     body="{\"accountId\":\""+acct+"\",\"password\":\""+cfg.dexPass+"\",\"applicationId\":\""+String(DEX_APPID)+"\"}";
     if(httpJson("POST",url,body,nullptr,nullptr,&resp)!=200)return false;
-    DynamicJsonDocument d2(256);
+    JsonDocument d2(&g_psram);
     if(deserializeJson(d2,resp)!=DeserializationError::Ok)return false;
     s_dexSession=d2.as<String>();
     if(s_dexSession=="null")s_dexSession="";
@@ -447,7 +458,7 @@ bool fetchDexcom(){
         s_dexSession="";if(!dexcomLogin())return false;   // session expired -> relogin
     }
     if(code!=200)return false;
-    DynamicJsonDocument doc(16384);
+    JsonDocument doc(&g_psram);
     if(deserializeJson(doc,resp)!=DeserializationError::Ok||!doc.is<JsonArray>())return false;
     JsonArray arr=doc.as<JsonArray>();int n=arr.size();if(n==0)return false;
     int v=arr[0]["Value"].as<int>();
@@ -491,7 +502,7 @@ bool libreLogin(){
     for(int attempt=0;attempt<2;attempt++){
         String resp;
         if(libreReq("POST",libreBase()+"/llu/auth/login",body,&resp)!=200)return false;
-        DynamicJsonDocument doc(8192);
+        JsonDocument doc(&g_psram);
         if(deserializeJson(doc,resp)!=DeserializationError::Ok)return false;
         JsonObject data=doc["data"];
         if(data.isNull())return false;
@@ -518,7 +529,7 @@ bool fetchLibre(){
             if(!libreLogin())return false;
             if(libreReq("GET",libreBase()+"/llu/connections","",&resp)!=200)return false;
         }
-        DynamicJsonDocument doc(8192);
+        JsonDocument doc(&g_psram);
         if(deserializeJson(doc,resp)!=DeserializationError::Ok)return false;
         JsonArray data=doc["data"];
         if(data.size()>0){const char*pid=data[0]["patientId"];if(pid)s_libPatient=String(pid);}
@@ -527,7 +538,7 @@ bool fetchLibre(){
     if(libreReq("GET",libreBase()+"/llu/connections/"+s_libPatient+"/graph","",&resp)!=200){
         s_libToken="";return false;                 // force re-login next poll
     }
-    DynamicJsonDocument doc(16384);
+    JsonDocument doc(&g_psram);
     if(deserializeJson(doc,resp)!=DeserializationError::Ok)return false;
     JsonObject gm=doc["data"]["connection"]["glucoseMeasurement"];
     if(gm.isNull())return false;
@@ -1598,7 +1609,18 @@ void loop(){
     // MaxAlloc = largest contiguous INTERNAL block (ESP.getMaxAllocHeap). If this shrinks
     // toward ~16-32KB while Heap stays high, the freeze is internal-heap FRAGMENTATION
     // (no contiguous block left for the next SSL buffer / DynamicJsonDocument) — not a leak.
-    if(now-lH>=60000){lH=now;Serial.println("Heap: "+String(ESP.getFreeHeap())+" MaxAlloc: "+String(ESP.getMaxAllocHeap())+" PSRAM: "+String(ESP.getFreePsram()));}
+    if(now-lH>=60000){lH=now;
+        size_t maxAlloc=ESP.getMaxAllocHeap();
+        Serial.println("Heap: "+String(ESP.getFreeHeap())+" MaxAlloc: "+String(maxAlloc)+" PSRAM: "+String(ESP.getFreePsram()));
+        // Safety net: if the largest contiguous INTERNAL block falls below what the next TLS
+        // handshake needs, reboot cleanly (~5s) before a hard freeze. With JSON in PSRAM this
+        // should rarely trigger; reset the crash counter so it's not mistaken for a crash.
+        if(maxAlloc<24000){
+            Serial.println("[heap] MaxAlloc low -> graceful reboot");
+            prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.end();
+            delay(200);ESP.restart();
+        }
+    }
     if(!inSettings){
         if(currentMode==MODE_PHOTOFRAME){
             if((unsigned long)(now-photoTimer)>=(unsigned long)cfg.photoMs)nextPhoto();

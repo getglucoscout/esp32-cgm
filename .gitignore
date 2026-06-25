@@ -1,6 +1,22 @@
+# Secrets — never commit. Copy secrets.example.h -> secrets.h and fill in.
+secrets.h
+**/secrets.h
+.env
+
+# Build output
 build/
-sdkconfig.old
+*.bin
+*.elf
+*.map
+*.hex
+
+# Arduino / ESP-IDF
 managed_components/
-dependencies.lock
+sdkconfig.old
+.pio/
+
+# Editor / OS
+.vscode/
+.idea/
 *.swp
 .DS_Store

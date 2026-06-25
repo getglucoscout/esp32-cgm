@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Blocking: a public repo must never carry real credentials, internal
+  # hostnames, or real IPs. secrets.h is git-ignored; only secrets.example.h
+  # (placeholders) is allowed.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for committed secrets
+        run: |
+          set -e
+          echo "Scanning for committed credentials..."
+          if grep -rInE '(WIFI_PASS|NS_SECRET|OTA_PASSWORD)[ \t]+"[^"]+"' . \
+               --include='*.ino' --include='*.c' --include='*.cpp' --include='*.h' \
+             | grep -vE 'secrets\.example\.h|YOUR_|""'; then
+            echo "::error::Possible committed secret — keep real values in the git-ignored secrets.h"; exit 1
+          fi
+          if grep -rInE '([0-9]{1,3}\.){3}[0-9]{1,3}' . \
+               --include='*.ino' --include='*.c' --include='*.cpp' --include='*.h' \
+             | grep -vE '0\.0\.0\.0|127\.0\.0\.1|255\.255\.255'; then
+            echo "::error::Possible real IP address in a public source file"; exit 1
+          fi
+          echo "Clean — no secrets found."
+
+  # Best-effort firmware build while the Arduino/lvgl toolchain is pinned down.
+  # Non-blocking during beta so a toolchain hiccup doesn't gate the release.
+  build-esp32-s3:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arduino-cli + ESP32 core
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/bin" sh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Build the S3 dashboard
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli lib install ArduinoJson JPEGDEC "lvgl@8.4.0"
+          cp boards/esp32-s3/guition-3.5in/lv_conf.h "$HOME/Arduino/libraries/lv_conf.h"
+          # Arduino requires the sketch file to sit in a folder of the same name.
+          mkdir -p /tmp/CGM_Dashboard
+          cp boards/esp32-s3/guition-3.5in/* /tmp/CGM_Dashboard/
+          cp /tmp/CGM_Dashboard/secrets.example.h /tmp/CGM_Dashboard/secrets.h
+          arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M /tmp/CGM_Dashboard

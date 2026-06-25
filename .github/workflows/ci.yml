@@ -33,11 +33,9 @@ jobs:
           fi
           echo "Clean — no secrets found."
 
-  # Best-effort firmware build while the Arduino/lvgl toolchain is pinned down.
-  # Non-blocking during beta so a toolchain hiccup doesn't gate the release.
+  # Build the firmware for each supported board (blocking — a broken build fails CI).
   build-esp32-s3:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Install arduino-cli + ESP32 core
@@ -57,4 +55,6 @@ jobs:
           mkdir -p /tmp/CGM_Dashboard
           cp boards/esp32-s3/guition-3.5in/* /tmp/CGM_Dashboard/
           cp /tmp/CGM_Dashboard/secrets.example.h /tmp/CGM_Dashboard/secrets.h
-          arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M /tmp/CGM_Dashboard
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:PSRAM=opi,FlashSize=16M,PartitionScheme=custom,CPUFreq=240,FlashMode=qio,CDCOnBoot=cdc \
+            /tmp/CGM_Dashboard

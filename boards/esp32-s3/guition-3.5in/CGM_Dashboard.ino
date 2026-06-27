@@ -1061,7 +1061,7 @@ void updateDashboardUI(){
     lv_obj_set_style_text_color(lbl_glucose,glucoseColor(gv),0);
     lv_label_set_text(lbl_trend,(ta+(gd>=0?" +"+String(gd):" "+String(gd))).c_str());
     lv_label_set_text(lbl_weather,ws.c_str());
-    lv_label_set_text(lbl_wifi,(String(WiFi.RSSI())+" dBm").c_str());
+    lv_label_set_text(lbl_wifi,(WiFi.localIP().toString()+"   "+String(WiFi.RSSI())+" dBm").c_str());
     drawSparkline();
     struct tm ti;
     if(getLocalTime(&ti)){
@@ -1267,7 +1267,9 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
 <div class="brow">
 <button class="bs" type="button" onclick="doSave()">Save Settings</button>
 <button class="br" type="button" onclick="doRestart()">Restart Board</button>
-</div></form>
+</div>
+<div class="brow"><button class="br" type="button" style="background:#8e2820;color:#fff" onclick="doFactoryReset()">Factory Reset</button></div>
+</form>
 <p class="ip">CGM-Dashboard &#8226; )HTML");
     html += (WiFi.localIP().toString());
     html += (R"HTML(</p>
@@ -1287,6 +1289,9 @@ function doSave(){
 function doRestart(){
   if(!confirm("Restart the board now?"))return;
   fetch("/restart",{method:"POST"});showToast("Restarting...");}
+function doFactoryReset(){
+  if(!confirm("Factory reset? Erases WiFi + all settings and reboots into the setup hotspot."))return;
+  fetch("/factoryreset",{method:"POST"});showToast("Factory reset - rebooting to setup...");}
 function lookupCity(){
   var name=prompt("Enter city name (e.g. 'New York' or 'Paris, France'):");
   if(!name)return;
@@ -1369,6 +1374,13 @@ void handleSave(){
 }
 
 void handleRestart(){configServer.send(200,"text/plain","Restarting...");delay(500);ESP.restart();}
+void handleFactoryReset(){
+    configServer.send(200,"text/plain","Factory reset - erasing settings, rebooting into setup...");
+    delay(500);
+    prefs.begin("cfg",false);  prefs.clear(); prefs.end();   // wipe WiFi + MQTT + all settings
+    prefs.begin("boot",false); prefs.clear(); prefs.end();   // wipe crash counter
+    delay(200); ESP.restart();                                // boots into the setup hotspot
+}
 void handleNotFound(){configServer.send(404,"text/plain","Not found");}
 
 // ================================================================
@@ -1502,6 +1514,7 @@ void startConfigServer(){
     configServer.on("/otacheck", HTTP_POST, handleOtaCheck);
     configServer.on("/otastatus",HTTP_GET,  handleOtaStatus);
     configServer.on("/restart",  HTTP_POST, handleRestart);
+    configServer.on("/factoryreset",HTTP_POST, handleFactoryReset);
     configServer.onNotFound(handleNotFound);
     configServer.begin();
     Serial.print("[WebServer] http://");Serial.println(WiFi.localIP());

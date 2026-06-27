@@ -143,6 +143,17 @@ String g_wifiScanOpts = "";      // cached <datalist> <option> list
 static lv_obj_t *lbl_glucose, *lbl_trend, *lbl_time, *lbl_date;
 static lv_obj_t *lbl_weather, *lbl_wifi,  *lbl_status, *lbl_gmi=nullptr;
 static lv_obj_t *lbl_fc[4]={nullptr,nullptr,nullptr,nullptr};   // 4-day forecast columns
+// Swipe pages: 0 = full dashboard, 1 = big glucose, 2 = device, 3 = HA control. Long-press = Settings (any page).
+#define NUM_PAGES 4
+// HA control buttons (page 3): UI (Core 1) sets a bit; fetchTask (Core 0) publishes the MQTT command.
+#define BTN_ANNOUNCE 0x01
+#define BTN_LIGHT    0x02
+#define BTN_SNOOZE   0x04
+#define BTN_GEN1     0x08
+#define BTN_GEN2     0x10
+static volatile uint8_t g_btnCmd=0;
+static int       currentPage=0;
+static lv_obj_t *lbl_dev_ip=nullptr,*lbl_dev_sig=nullptr,*lbl_dev_ha=nullptr;
 
 // Sparkline
 #define SPARK_POINTS 36   // ~3hr at 5min intervals
@@ -154,8 +165,9 @@ static lv_obj_t  *spark_canvas = nullptr;
 static lv_color_t *spark_buf   = nullptr;
 
 // Touch settings menu
-static lv_obj_t *settings_modal = nullptr;
-static bool      inSettings     = false;
+static lv_obj_t *settings_modal  = nullptr;
+static lv_obj_t *factory_confirm = nullptr;   // on-screen factory-reset confirm overlay
+static bool      inSettings      = false;
 
 // Forward declarations
 void enterDashboard();
@@ -165,6 +177,8 @@ void handleWifiSetupPage();
 
 static SemaphoreHandle_t dataMutex;
 static int    glucose_val=0, glucose_delta=0;
+static volatile int  g_wxHttp=-1;      // last open-meteo HTTP code (-1 = not run yet) [diag]
+static volatile bool g_wxParse=false;  // last weather JSON parse ok? [diag]
 static String trend_arrow="-", weather_str="--";
 static volatile bool ns_data_ready=false, wx_data_ready=false;
 static float gmi30=0, gmi90=0;          // estimated A1C (GMI %) over 30/90 days
@@ -326,9 +340,12 @@ void fetchWeather(){
              +"&temperature_unit="+unitName
              +"&timezone=auto&forecast_days=5");
     h.setTimeout(10000);
-    if(h.GET()==200){
-        JsonDocument doc(&g_psram);
-        if(deserializeJson(doc,h.getStream())==DeserializationError::Ok){  // stream-parse: no big internal String
+    int wxCode=h.GET(); g_wxHttp=wxCode;
+    if(wxCode==200){
+        String resp=h.getString();          // dechunk first: open-meteo uses chunked transfer,
+        JsonDocument doc(&g_psram);          // which a raw getStream() can't feed to ArduinoJson
+        bool wxOk=(deserializeJson(doc,resp)==DeserializationError::Ok); g_wxParse=wxOk;
+        if(wxOk){
             String suffix=cfg.isCelsius?"C":"F";
             String w=String((int)doc["current"]["temperature_2m"].as<float>())
                     +suffix+"  "+wxDesc(doc["current"]["weather_code"].as<int>());
@@ -589,6 +606,7 @@ static WiFiClient    mqttNet;
 static PubSubClient  mqtt(mqttNet);
 static bool          mqttDiscoverySent=false;
 static volatile bool mqttReconfig=false;
+static volatile bool g_mqttUp=false;   // HA/MQTT link state, for the on-screen status (set on Core 0, read by UI)
 static unsigned long mqttLastTry=0;
 
 String mqttNodeId(){ String m=WiFi.macAddress(); m.replace(":",""); m.toLowerCase(); return "glucoscout_"+m; }
@@ -652,18 +670,24 @@ void mqttPublishState(){
 void mqttEnsure(){            // every ~1s from fetchTask (Core 0): keepalive + reconnect
     static bool inited=false;
     if(mqttReconfig){mqttReconfig=false;if(mqtt.connected())mqtt.disconnect();mqttDiscoverySent=false;}
-    if(mqttHostEff().length()==0)return;                    // standalone
-    if(mqtt.connected()){mqtt.loop();return;}
+    if(mqttHostEff().length()==0){g_mqttUp=false;return;}   // standalone
+    if(mqtt.connected()){g_mqttUp=true;mqtt.loop();return;}
+    g_mqttUp=false;
     unsigned long now=millis();
     if(inited && (int32_t)(now-mqttLastTry)<5000)return;    // throttle reconnect
     mqttLastTry=now;
     if(!inited){mqtt.setBufferSize(512);inited=true;}       // HA discovery configs ~400B
     int port=cfg.mqttPort>0?cfg.mqttPort:1883;
-    mqtt.setServer(mqttHostEff().c_str(),port);
+    // PubSubClient::setServer stores the char* WITHOUT copying — must point at a
+    // buffer that outlives the connect, not a temporary String's freed c_str().
+    static String mqttHostBuf;
+    mqttHostBuf=mqttHostEff();
+    mqtt.setServer(mqttHostBuf.c_str(),port);
     String node=mqttNodeId(), availT="glucoscout/"+node+"/status";
     String u=mqttUserEff(),pw=mqttPassEff();
     bool ok=mqtt.connect(node.c_str(), u.length()?u.c_str():nullptr, pw.length()?pw.c_str():nullptr,
                          availT.c_str(),0,true,"offline");
+    g_mqttUp=ok;
     if(ok){
         Serial.printf("[MQTT] connected -> %s:%d\n",mqttHostEff().c_str(),port);
         mqtt.publish(availT.c_str(),"online",true);
@@ -710,6 +734,14 @@ void otaRunUpdate(){          // Core 0 (fetchTask) ONLY — blocking; reboots o
 }
 void handleOtaCheck(){ otaRequested=true; configServer.send(200,"text/plain","Checking for updates..."); }
 void handleOtaStatus(){ configServer.send(200,"text/plain", String(FW_VERSION)+" | "+otaStatus); }
+void handleDbg(){
+    String s="src="+String(cgmSourceName())+" gv="+String(glucose_val)
+            +" wx='"+weather_str+"' wxHttp="+String(g_wxHttp)+" wxParse="+String(g_wxParse?1:0)
+            +" wifi="+String(WiFi.status()==WL_CONNECTED?1:0)+" rssi="+String(WiFi.RSSI())
+            +" mqttHost="+mqttHostEff()+" mqttUp="+String(g_mqttUp?1:0)+" mqttState="+String(mqtt.state())
+            +" heap="+String(ESP.getFreeHeap())+" psram="+String(ESP.getFreePsram());
+    configServer.send(200,"text/plain",s);
+}
 
 void fetchTask(void*p){
     while(WiFi.status()!=WL_CONNECTED)vTaskDelay(pdMS_TO_TICKS(500));
@@ -718,6 +750,14 @@ void fetchTask(void*p){
     for(;;){
         unsigned long now=millis();checkWiFi();
         mqttEnsure();
+        if(g_btnCmd && mqtt.connected()){          // HA control buttons (page 3) -> MQTT commands
+            uint8_t c=g_btnCmd; g_btnCmd=0; String nd=mqttNodeId();
+            if(c&BTN_ANNOUNCE) mqtt.publish(("glucoscout/"+nd+"/cmd/announce").c_str(),"1");
+            if(c&BTN_LIGHT)    mqtt.publish(("glucoscout/"+nd+"/cmd/light").c_str(),"toggle");
+            if(c&BTN_SNOOZE)   mqtt.publish(("glucoscout/"+nd+"/cmd/snooze").c_str(),"1");
+            if(c&BTN_GEN1)     mqtt.publish(("glucoscout/"+nd+"/button/1").c_str(),"1");
+            if(c&BTN_GEN2)     mqtt.publish(("glucoscout/"+nd+"/button/2").c_str(),"1");
+        }
         if(otaRequested){otaRequested=false;otaRunUpdate();}
         if(now-nNS>=NS_UPDATE_MS){nNS=now;fetchGlucose();mqttPublishState();}
         if(now-nOTA>=OTA_CHECK_MS){nOTA=now;otaRunUpdate();}
@@ -816,6 +856,7 @@ static void settingBtn_cb(lv_event_t *e){
 
 static void settingsClose_cb(lv_event_t *e){
     saveConfig();
+    if(factory_confirm){lv_obj_del(factory_confirm);factory_confirm=nullptr;}
     if(settings_modal){lv_obj_del(settings_modal);settings_modal=nullptr;}
     inSettings=false;
     struct tm ti;
@@ -868,6 +909,74 @@ static void addSettingRow(lv_obj_t *parent,int idx,const char *label,int *value,
     lv_label_set_text(lp,"+");lv_obj_set_style_text_font(lp,&lv_font_montserrat_20,0);lv_obj_center(lp);
 }
 
+// Wipe WiFi + all settings and reboot into the setup hotspot. Shared by the
+// web config page and the on-screen Factory Reset button.
+void factoryResetNow(){
+    prefs.begin("cfg",false);  prefs.clear(); prefs.end();   // wipe WiFi + MQTT + all settings
+    prefs.begin("boot",false); prefs.clear(); prefs.end();   // wipe crash counter
+    delay(200); ESP.restart();                                // boots into the setup hotspot
+}
+
+static const char* rssiQuality(int r){
+    if(r>=-55)return "Excellent";
+    if(r>=-67)return "Good";
+    if(r>=-75)return "Fair";
+    if(r>=-85)return "Weak";
+    return "Very weak";
+}
+
+static void factoryCancel_cb(lv_event_t *e){
+    if(factory_confirm){lv_obj_del(factory_confirm);factory_confirm=nullptr;}
+}
+static void factoryConfirm_cb(lv_event_t *e){
+    if(factory_confirm){                                       // swap the dialog for an "erasing" notice
+        lv_obj_clean(factory_confirm);
+        lv_obj_t *m=lv_label_create(factory_confirm);
+        lv_label_set_text(m,"Erasing...\nRebooting to setup");
+        lv_obj_set_style_text_color(m,lv_color_hex(0xFFFFFF),0);
+        lv_obj_set_style_text_font(m,&lv_font_montserrat_18,0);
+        lv_obj_set_style_text_align(m,LV_TEXT_ALIGN_CENTER,0);
+        lv_obj_center(m);
+    }
+    lv_refr_now(NULL);                                         // render the notice before we reboot
+    factoryResetNow();
+}
+static void showFactoryConfirm(){
+    if(factory_confirm)return;
+    factory_confirm=lv_obj_create(lv_scr_act());
+    lv_obj_set_size(factory_confirm,380,180);lv_obj_center(factory_confirm);
+    lv_obj_set_style_bg_color(factory_confirm,lv_color_hex(0x1A0A0A),0);
+    lv_obj_set_style_bg_opa(factory_confirm,LV_OPA_COVER,0);
+    lv_obj_set_style_border_color(factory_confirm,lv_color_hex(0x8E2820),0);
+    lv_obj_set_style_border_width(factory_confirm,2,0);
+    lv_obj_set_style_radius(factory_confirm,12,0);
+    lv_obj_clear_flag(factory_confirm,LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m=lv_label_create(factory_confirm);
+    lv_label_set_text(m,"Factory Reset?\nErases WiFi + all settings\nand reboots to the setup hotspot.");
+    lv_obj_set_style_text_color(m,lv_color_hex(0xFFFFFF),0);
+    lv_obj_set_style_text_font(m,&lv_font_montserrat_14,0);
+    lv_obj_set_style_text_align(m,LV_TEXT_ALIGN_CENTER,0);
+    lv_obj_align(m,LV_ALIGN_TOP_MID,0,16);
+
+    lv_obj_t *bc=lv_btn_create(factory_confirm);
+    lv_obj_set_size(bc,165,46);lv_obj_align(bc,LV_ALIGN_BOTTOM_LEFT,6,-8);
+    lv_obj_set_style_bg_color(bc,lv_color_hex(0x445566),0);lv_obj_set_style_radius(bc,8,0);
+    lv_obj_add_event_cb(bc,factoryCancel_cb,LV_EVENT_CLICKED,NULL);
+    lv_obj_t *lc=lv_label_create(bc);lv_label_set_text(lc,"Cancel");
+    lv_obj_set_style_text_color(lc,lv_color_hex(0xFFFFFF),0);
+    lv_obj_set_style_text_font(lc,&lv_font_montserrat_16,0);lv_obj_center(lc);
+
+    lv_obj_t *be=lv_btn_create(factory_confirm);
+    lv_obj_set_size(be,165,46);lv_obj_align(be,LV_ALIGN_BOTTOM_RIGHT,-6,-8);
+    lv_obj_set_style_bg_color(be,lv_color_hex(0x8E2820),0);lv_obj_set_style_radius(be,8,0);
+    lv_obj_add_event_cb(be,factoryConfirm_cb,LV_EVENT_CLICKED,NULL);
+    lv_obj_t *le=lv_label_create(be);lv_label_set_text(le,"Erase");
+    lv_obj_set_style_text_color(le,lv_color_hex(0xFFFFFF),0);
+    lv_obj_set_style_text_font(le,&lv_font_montserrat_16,0);lv_obj_center(le);
+}
+static void factoryBtn_cb(lv_event_t *e){ showFactoryConfirm(); }
+
 void showSettingsMenu(){
     if(inSettings||settings_modal)return;
     inSettings=true;
@@ -888,20 +997,37 @@ void showSettingsMenu(){
 
     int listY=28;
 
+    // Scrollable settings list — holds the adjustable rows, the read-only
+    // device-info block, and the Factory Reset button. Scrolls on the 3.5" panel.
     lv_obj_t *list=lv_obj_create(settings_modal);
-    lv_obj_set_size(list,470,235);
+    lv_obj_set_size(list,470,248);
     lv_obj_set_pos(list,0,listY);
     lv_obj_set_style_bg_opa(list,LV_OPA_TRANSP,0);
     lv_obj_set_style_border_width(list,0,0);
     lv_obj_set_style_pad_all(list,2,0);
     lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(list,2,0);
+    lv_obj_set_style_pad_row(list,6,0);
+    lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_AUTO);
 
     gSettingCount=0;
     addSettingRow(list,0,"Day Brightness",&cfg.dayBright,10,100,5,"%");
     addSettingRow(list,1,"Night Brightness",&cfg.nightBright,5,100,5,"%");
     addSettingRow(list,2,"Critical Low",&cfg.critLow,40,100,5,"");
     addSettingRow(list,3,"Critical High",&cfg.critHigh,150,400,10,"");
+
+    // (Device info — IP / WiFi signal / Home Assistant — is on the swipe Device page.)
+
+    // On-screen Factory Reset (asks to confirm before wiping)
+    lv_obj_t *fr=lv_btn_create(list);
+    lv_obj_set_size(fr,456,38);
+    lv_obj_set_style_bg_color(fr,lv_color_hex(0x8E2820),0);
+    lv_obj_set_style_radius(fr,8,0);
+    lv_obj_add_event_cb(fr,factoryBtn_cb,LV_EVENT_CLICKED,NULL);
+    lv_obj_t *frl=lv_label_create(fr);
+    lv_label_set_text(frl,"Factory Reset");
+    lv_obj_set_style_text_color(frl,lv_color_hex(0xFFFFFF),0);
+    lv_obj_set_style_text_font(frl,&lv_font_montserrat_16,0);
+    lv_obj_center(frl);
 
     lv_obj_t *btn=lv_btn_create(settings_modal);
     lv_obj_set_size(btn,460,38);
@@ -944,10 +1070,7 @@ void createDashboardUI(){
     lv_obj_set_style_text_color(lbl_time,lv_color_hex(0xFFFFFF),0);
     lv_obj_set_style_text_font(lbl_time,&lv_font_montserrat_22,0);
     lv_obj_align(lbl_time,LV_ALIGN_RIGHT_MID,-12,0);
-    lbl_wifi=lv_label_create(tb);lv_label_set_text(lbl_wifi,"--- dBm");
-    lv_obj_set_style_text_color(lbl_wifi,lv_color_hex(0xDD00FF),0);
-    lv_obj_set_style_text_font(lbl_wifi,&lv_font_montserrat_12,0);
-    lv_obj_align(lbl_wifi,LV_ALIGN_CENTER,0,0);
+    lbl_wifi=nullptr;   // WiFi signal moved off the main screen → Settings menu (long-press)
 
     lv_obj_t*gc=lv_obj_create(scr);lv_obj_set_size(gc,460,150);lv_obj_set_pos(gc,10,62);
     lv_obj_set_style_bg_color(gc,lv_color_hex(0x0D1B2A),0);
@@ -1034,6 +1157,126 @@ void createDashboardUI(){
     lv_obj_align(ip,LV_ALIGN_RIGHT_MID,-8,0);
 }
 
+// ---- Page 1: big glucose (across-the-room view) ----
+void buildBigGlucosePage(){
+    lv_obj_t*scr=lv_scr_act();
+    lbl_glucose=lv_label_create(scr);lv_label_set_text(lbl_glucose,"---");
+    lv_obj_set_style_text_color(lbl_glucose,lv_color_hex(0x00FF88),0);
+    lv_obj_set_style_text_font(lbl_glucose,&lv_font_montserrat_48,0);
+    lv_obj_align(lbl_glucose,LV_ALIGN_TOP_MID,0,44);
+    lv_obj_t*u=lv_label_create(scr);lv_label_set_text(u,"mg/dL");
+    lv_obj_set_style_text_color(u,lv_color_hex(0x556677),0);
+    lv_obj_set_style_text_font(u,&lv_font_montserrat_16,0);
+    lv_obj_align(u,LV_ALIGN_TOP_MID,0,104);
+    lbl_trend=lv_label_create(scr);lv_label_set_text(lbl_trend,"->  +0");
+    lv_obj_set_style_text_color(lbl_trend,lv_color_hex(0xFFDD00),0);
+    lv_obj_set_style_text_font(lbl_trend,&lv_font_montserrat_28,0);
+    lv_obj_align(lbl_trend,LV_ALIGN_TOP_MID,0,134);
+    lbl_gmi=lv_label_create(scr);lv_label_set_text(lbl_gmi,"GMI --");
+    lv_obj_set_style_text_color(lbl_gmi,lv_color_hex(0x66AAFF),0);
+    lv_obj_set_style_text_font(lbl_gmi,&lv_font_montserrat_16,0);
+    lv_obj_align(lbl_gmi,LV_ALIGN_TOP_MID,0,176);
+    if(!spark_buf) spark_buf=(lv_color_t*)heap_caps_malloc(SPARK_W*SPARK_H*sizeof(lv_color_t),MALLOC_CAP_SPIRAM);
+    if(spark_buf){
+        spark_canvas=lv_canvas_create(scr);
+        lv_canvas_set_buffer(spark_canvas,spark_buf,SPARK_W,SPARK_H,LV_IMG_CF_TRUE_COLOR);
+        lv_obj_align(spark_canvas,LV_ALIGN_BOTTOM_MID,0,-34);
+        lv_canvas_fill_bg(spark_canvas,lv_color_hex(0x0A1622),LV_OPA_COVER);
+    }
+}
+
+// ---- Page 2: device / Home Assistant status ----
+void buildDevicePage(){
+    lv_obj_t*scr=lv_scr_act();
+    lv_obj_t*h=lv_label_create(scr);lv_label_set_text(h,"DEVICE");
+    lv_obj_set_style_text_color(h,lv_color_hex(0xE74C3C),0);
+    lv_obj_set_style_text_font(h,&lv_font_montserrat_18,0);
+    lv_obj_align(h,LV_ALIGN_TOP_MID,0,22);
+    lbl_dev_ip=lv_label_create(scr);lv_label_set_text(lbl_dev_ip,"IP:  --");
+    lv_obj_set_style_text_color(lbl_dev_ip,lv_color_hex(0xC8D6E5),0);
+    lv_obj_set_style_text_font(lbl_dev_ip,&lv_font_montserrat_16,0);
+    lv_obj_align(lbl_dev_ip,LV_ALIGN_TOP_LEFT,22,72);
+    lbl_dev_sig=lv_label_create(scr);lv_label_set_text(lbl_dev_sig,"WiFi:  --");
+    lv_obj_set_style_text_color(lbl_dev_sig,lv_color_hex(0xC8D6E5),0);
+    lv_obj_set_style_text_font(lbl_dev_sig,&lv_font_montserrat_16,0);
+    lv_obj_align(lbl_dev_sig,LV_ALIGN_TOP_LEFT,22,108);
+    lbl_dev_ha=lv_label_create(scr);lv_label_set_text(lbl_dev_ha,"Home Assistant:  --");
+    lv_obj_set_style_text_color(lbl_dev_ha,lv_color_hex(0x66AAFF),0);
+    lv_obj_set_style_text_font(lbl_dev_ha,&lv_font_montserrat_16,0);
+    lv_obj_align(lbl_dev_ha,LV_ALIGN_TOP_LEFT,22,144);
+    lv_obj_t*fw=lv_label_create(scr);lv_label_set_text(fw,(String("Firmware ")+FW_VERSION).c_str());
+    lv_obj_set_style_text_color(fw,lv_color_hex(0x556677),0);
+    lv_obj_set_style_text_font(fw,&lv_font_montserrat_14,0);
+    lv_obj_align(fw,LV_ALIGN_BOTTOM_LEFT,22,-30);
+    lv_obj_t*hint=lv_label_create(scr);lv_label_set_text(hint,"Long-press for Settings");
+    lv_obj_set_style_text_color(hint,lv_color_hex(0x445566),0);
+    lv_obj_set_style_text_font(hint,&lv_font_montserrat_12,0);
+    lv_obj_align(hint,LV_ALIGN_BOTTOM_RIGHT,-12,-30);
+}
+
+// ---- Page 3: Home Assistant control (buttons publish MQTT -> HA automations) ----
+static void haBtn_cb(lv_event_t *e){ g_btnCmd |= (uint8_t)(intptr_t)lv_event_get_user_data(e); }
+void buildHaPage(){
+    lv_obj_t*scr=lv_scr_act();
+    lv_obj_t*h=lv_label_create(scr);lv_label_set_text(h,"HOME ASSISTANT");
+    lv_obj_set_style_text_color(h,lv_color_hex(0x41BDF5),0);
+    lv_obj_set_style_text_font(h,&lv_font_montserrat_18,0);
+    lv_obj_align(h,LV_ALIGN_TOP_MID,0,22);
+    struct { const char*l; uint32_t col; uint8_t bit; } B[5]={
+        {"Announce Glucose",0x2D6CDF,BTN_ANNOUNCE},
+        {"Toggle Light",    0x00AA66,BTN_LIGHT},
+        {"Snooze Alert",    0xC0392B,BTN_SNOOZE},
+        {"Button 1",        0x445566,BTN_GEN1},
+        {"Button 2",        0x445566,BTN_GEN2},
+    };
+    int y=52;
+    for(int i=0;i<5;i++){
+        lv_obj_t*b=lv_btn_create(scr);
+        lv_obj_set_size(b,456,40);lv_obj_set_pos(b,12,y);y+=48;
+        lv_obj_set_style_bg_color(b,lv_color_hex(B[i].col),0);
+        lv_obj_set_style_radius(b,8,0);
+        lv_obj_add_flag(b,LV_OBJ_FLAG_EVENT_BUBBLE);   // let swipes bubble to the page handler
+        lv_obj_add_event_cb(b,haBtn_cb,LV_EVENT_CLICKED,(void*)(intptr_t)B[i].bit);
+        lv_obj_t*l=lv_label_create(b);lv_label_set_text(l,B[i].l);
+        lv_obj_set_style_text_color(l,lv_color_hex(0xFFFFFF),0);
+        lv_obj_set_style_text_font(l,&lv_font_montserrat_16,0);
+        lv_obj_center(l);
+    }
+}
+
+// ---- Page indicator dots (top-center) ----
+void addPageDots(){
+    lv_obj_t*scr=lv_scr_act();
+    int gap=16, totalW=(NUM_PAGES-1)*gap;
+    for(int i=0;i<NUM_PAGES;i++){
+        lv_obj_t*d=lv_obj_create(scr);
+        lv_obj_set_size(d,8,8);
+        lv_obj_set_style_radius(d,4,0);
+        lv_obj_set_style_border_width(d,0,0);
+        lv_obj_set_style_bg_color(d,i==currentPage?lv_color_hex(0x00FF88):lv_color_hex(0x33485C),0);
+        lv_obj_clear_flag(d,LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(d,LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_set_pos(d,240-totalW/2-4+i*gap,6);
+    }
+}
+
+// ---- Build the currently-selected page (clears the screen first) ----
+void buildPage(){
+    lbl_glucose=lbl_trend=lbl_time=lbl_date=lbl_weather=lbl_wifi=lbl_status=lbl_gmi=nullptr;
+    for(int i=0;i<4;i++)lbl_fc[i]=nullptr;
+    lbl_dev_ip=lbl_dev_sig=lbl_dev_ha=nullptr;
+    spark_canvas=nullptr;
+    lv_obj_t*scr=lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr,lv_color_hex(0x060A14),0);
+    lv_obj_set_style_bg_opa(scr,LV_OPA_COVER,0);
+    if(currentPage==0)      createDashboardUI();
+    else if(currentPage==1) buildBigGlucosePage();
+    else if(currentPage==2) buildDevicePage();
+    else                    buildHaPage();
+    addPageDots();
+}
+
 // ================================================================
 // UI updates
 // ================================================================
@@ -1057,14 +1300,29 @@ void updateDashboardUI(){
             lv_label_set_text(lbl_fc[i],b);
         } else lv_label_set_text(lbl_fc[i],"--\n--\n--");
     }
-    lv_label_set_text(lbl_glucose,gv>0?String(gv).c_str():"---");
-    lv_obj_set_style_text_color(lbl_glucose,glucoseColor(gv),0);
-    lv_label_set_text(lbl_trend,(ta+(gd>=0?" +"+String(gd):" "+String(gd))).c_str());
-    lv_label_set_text(lbl_weather,ws.c_str());
-    lv_label_set_text(lbl_wifi,(WiFi.localIP().toString()+"   "+String(WiFi.RSSI())+" dBm").c_str());
+    if(lbl_glucose){
+        lv_label_set_text(lbl_glucose,gv>0?String(gv).c_str():"---");
+        lv_obj_set_style_text_color(lbl_glucose,glucoseColor(gv),0);
+    }
+    if(lbl_trend) lv_label_set_text(lbl_trend,(ta+(gd>=0?" +"+String(gd):" "+String(gd))).c_str());
+    if(lbl_weather) lv_label_set_text(lbl_weather,ws.c_str());
+    if(lbl_wifi) lv_label_set_text(lbl_wifi,(String(WiFi.RSSI())+" dBm").c_str());
     drawSparkline();
+    // Device/HA page (page 2) live fields
+    bool wifiUp=WiFi.isConnected();
+    if(lbl_dev_ip) lv_label_set_text(lbl_dev_ip,("IP:  "+(wifiUp?WiFi.localIP().toString():String("not connected"))).c_str());
+    if(lbl_dev_sig){
+        if(wifiUp){int r=WiFi.RSSI();lv_label_set_text(lbl_dev_sig,("WiFi:  "+String(r)+" dBm  ("+rssiQuality(r)+")").c_str());}
+        else lv_label_set_text(lbl_dev_sig,"WiFi:  --");
+    }
+    if(lbl_dev_ha){
+        String hh=mqttHostEff();
+        if(hh.length()==0)  lv_label_set_text(lbl_dev_ha,"Home Assistant:  not set up");
+        else if(g_mqttUp)   lv_label_set_text(lbl_dev_ha,("Home Assistant:  connected\n("+hh+")").c_str());
+        else                lv_label_set_text(lbl_dev_ha,("Home Assistant:  connecting...\n("+hh+")").c_str());
+    }
     struct tm ti;
-    if(getLocalTime(&ti)){
+    if(lbl_status && getLocalTime(&ti)){
         char b[40];strftime(b,sizeof(b),"Last updated %I:%M %p",&ti);
         lv_label_set_text(lbl_status,b);
     }
@@ -1074,8 +1332,22 @@ void updateDashboardUI(){
 // ================================================================
 void enterDashboard(){
     spark_canvas=nullptr;
-    bsp_display_lock(100);lv_obj_clean(lv_scr_act());
-    createDashboardUI();updateDashboardUI();bsp_display_unlock();
+    bsp_display_lock(100);
+    buildPage();updateDashboardUI();bsp_display_unlock();
+}
+
+// Swipe left/right to switch pages (Settings via long-press is unaffected).
+static void screenGesture_cb(lv_event_t *e){
+    if(inSettings)return;
+    lv_indev_t *indev=lv_indev_get_act();
+    lv_dir_t d=lv_indev_get_gesture_dir(indev);
+    if(d==LV_DIR_LEFT)       currentPage=(currentPage+1)%NUM_PAGES;
+    else if(d==LV_DIR_RIGHT) currentPage=(currentPage+NUM_PAGES-1)%NUM_PAGES;
+    else return;
+    lv_indev_wait_release(indev);   // one page-change per swipe
+    bsp_display_lock(100);
+    buildPage();updateDashboardUI();
+    bsp_display_unlock();
 }
 void applyBrightness(int h){
     bool n=(h>=cfg.nightStart&&h<cfg.nightEnd);
@@ -1264,6 +1536,13 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
     tzOpt("NZST-12NZDT,M9.5.0,M4.1.0/3","New Zealand");
     tzOpt("UTC0","UTC");
     html += (R"HTML(</select></div></div>
+<div class="card"><h2>Firmware</h2>
+<div class="row"><label>Current version</label><span style="font-weight:700">)HTML");
+    html += (FW_VERSION);
+    html += (R"HTML(</span></div>
+<div class="row"><label>Check for update<small>pulls a newer release over GitHub OTA</small></label>
+<button type="button" class="br" style="padding:7px 14px;font-size:.85rem" onclick="doOtaCheck()">Check for Updates</button></div>
+<div class="row"><label>Status</label><span id="otastat">idle</span></div></div>
 <div class="brow">
 <button class="bs" type="button" onclick="doSave()">Save Settings</button>
 <button class="br" type="button" onclick="doRestart()">Restart Board</button>
@@ -1292,6 +1571,16 @@ function doRestart(){
 function doFactoryReset(){
   if(!confirm("Factory reset? Erases WiFi + all settings and reboots into the setup hotspot."))return;
   fetch("/factoryreset",{method:"POST"});showToast("Factory reset - rebooting to setup...");}
+function doOtaCheck(){
+  showToast("Checking for updates...");
+  document.getElementById("otastat").textContent="checking...";
+  fetch("/otacheck",{method:"POST"});
+  var n=0,iv=setInterval(function(){
+    fetch("/otastatus").then(function(r){return r.text();}).then(function(t){
+      document.getElementById("otastat").textContent=t;
+      if(++n>20||/up to date|failed|no update|no url/i.test(t))clearInterval(iv);
+    }).catch(function(){document.getElementById("otastat").textContent="updating/rebooting...";clearInterval(iv);});
+  },1500);}
 function lookupCity(){
   var name=prompt("Enter city name (e.g. 'New York' or 'Paris, France'):");
   if(!name)return;
@@ -1377,9 +1666,7 @@ void handleRestart(){configServer.send(200,"text/plain","Restarting...");delay(5
 void handleFactoryReset(){
     configServer.send(200,"text/plain","Factory reset - erasing settings, rebooting into setup...");
     delay(500);
-    prefs.begin("cfg",false);  prefs.clear(); prefs.end();   // wipe WiFi + MQTT + all settings
-    prefs.begin("boot",false); prefs.clear(); prefs.end();   // wipe crash counter
-    delay(200); ESP.restart();                                // boots into the setup hotspot
+    factoryResetNow();
 }
 void handleNotFound(){configServer.send(404,"text/plain","Not found");}
 
@@ -1513,6 +1800,7 @@ void startConfigServer(){
     configServer.on("/save",     HTTP_POST, handleSave);
     configServer.on("/otacheck", HTTP_POST, handleOtaCheck);
     configServer.on("/otastatus",HTTP_GET,  handleOtaStatus);
+    configServer.on("/dbg",      HTTP_GET,  handleDbg);
     configServer.on("/restart",  HTTP_POST, handleRestart);
     configServer.on("/factoryreset",HTTP_POST, handleFactoryReset);
     configServer.onNotFound(handleNotFound);
@@ -1559,8 +1847,9 @@ void setup(){
     startConfigServer();
     configTime(0,0,"pool.ntp.org","time.nist.gov");
     applyTimezone();
-    bsp_display_lock(100);lv_obj_clean(lv_scr_act());createDashboardUI();
+    bsp_display_lock(100);buildPage();
     lv_obj_add_event_cb(lv_scr_act(),screenLongPress_cb,LV_EVENT_LONG_PRESSED,NULL);
+    lv_obj_add_event_cb(lv_scr_act(),screenGesture_cb,LV_EVENT_GESTURE,NULL);
     bsp_display_unlock();
     fetchGlucose();fetchWeather();
     bsp_display_lock(100);updateDashboardUI();bsp_display_unlock();
@@ -1607,7 +1896,7 @@ void loop(){
             if(getLocalTime(&ti)){
                 char tb[20],db[30];
                 strftime(tb,sizeof(tb),"%I:%M %p",&ti);strftime(db,sizeof(db),"%a, %b %d",&ti);
-                if(bsp_display_lock(200)){lv_label_set_text(lbl_time,tb);lv_label_set_text(lbl_date,db);bsp_display_unlock();}
+                if(bsp_display_lock(200)){if(lbl_time)lv_label_set_text(lbl_time,tb);if(lbl_date)lv_label_set_text(lbl_date,db);bsp_display_unlock();}
                 static int lHr=-1;if(ti.tm_hour!=lHr){lHr=ti.tm_hour;applyBrightness(ti.tm_hour);}
             }
         }

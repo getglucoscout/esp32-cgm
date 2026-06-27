@@ -1,7 +1,7 @@
 // ============================================================
-// CGM Dashboard + Photo Frame — JC3248W535C (ESP32-S3)
-// Nightscout + Weather + Clock + WiFi + SD Photo Frame
-// Web Config Page + SD Browser + Delete (uploads removed - use PC tool)
+// CGM Dashboard — JC3248W535C (ESP32-S3)
+// Nightscout / Dexcom / Libre + Weather + Clock + WiFi
+// Home Assistant MQTT + internet OTA + Web Config Page
 // ============================================================
 
 #include "display.h"
@@ -12,8 +12,6 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
-#include <SD.h>
-#include <JPEGDEC.h>
 #include <time.h>
 #include "mbedtls/sha1.h"
 #include "mbedtls/sha256.h"
@@ -46,15 +44,10 @@ static PsramAllocator g_psram;
 #define GMI_COUNT_90D       25920               // ~90 days at 5-min readings
 #define DEX_APPID  "d89443d2-327c-4a6f-89e5-496bbb0317db"   // well-known Dexcom Share app id
 #define SAFE_MODE_CRASHES   3
-#define SD_CS    10
-#define SD_MOSI  11
-#define SD_CLK   12
-#define SD_MISO  13
-#define MAX_PHOTOS 50
 
 struct DashConfig {
     int dayBright, nightBright, nightStart, nightEnd;
-    int dashboardMs, photoMs, critLow, critHigh;
+    int dashboardMs, critLow, critHigh;
     int cgmSource;                       // 0=Nightscout 1=Dexcom 2=Libre
     String lat, lon, city;
     bool isCelsius;
@@ -65,7 +58,7 @@ struct DashConfig {
     String mqttHost, mqttUser, mqttPass; // Home Assistant MQTT broker (blank host -> off)
     int    mqttPort;                     // default 1883
 };
-DashConfig cfg = {100,20,1,7,10000,10000,70,280, 0,
+DashConfig cfg = {100,20,1,7,10000,70,280, 0,
                   "40.7128","-74.0060","New York",false,"EST5EDT,M3.2.0,M11.1.0",
                   "","","us", "","","us", "","", "","","",1883};
 
@@ -76,7 +69,6 @@ void loadConfig() {
     cfg.nightStart  = prefs.getInt("nightStart",    1);
     cfg.nightEnd    = prefs.getInt("nightEnd",       7);
     cfg.dashboardMs = prefs.getInt("dashboardMs", 10000);
-    cfg.photoMs     = prefs.getInt("photoMs",     10000);
     cfg.critLow     = prefs.getInt("critLow",        70);
     cfg.critHigh    = prefs.getInt("critHigh",      280);
     cfg.lat         = prefs.getString("lat",   "40.7128");
@@ -106,7 +98,6 @@ void saveConfig() {
     prefs.putInt("nightStart",  cfg.nightStart);
     prefs.putInt("nightEnd",    cfg.nightEnd);
     prefs.putInt("dashboardMs", cfg.dashboardMs);
-    prefs.putInt("photoMs",     cfg.photoMs);
     prefs.putInt("critLow",     cfg.critLow);
     prefs.putInt("critHigh",    cfg.critHigh);
     prefs.putString("lat",      cfg.lat);
@@ -136,21 +127,10 @@ void applyTimezone(){
 }
 
 WebServer configServer(80);
-SPIClass  sdSPI(HSPI);
-
-enum AppMode { MODE_DASHBOARD, MODE_PHOTOFRAME };
-static AppMode       currentMode = MODE_DASHBOARD;
-static unsigned long modeTimer   = 0;
-static unsigned long photoTimer  = 0;
-static char  photoPaths[MAX_PHOTOS][64];
-static int   photoCount = 0, photoIndex = 0;
-static bool  sdAvailable = false;
 
 static lv_obj_t *lbl_glucose, *lbl_trend, *lbl_time, *lbl_date;
 static lv_obj_t *lbl_weather, *lbl_wifi,  *lbl_status, *lbl_gmi=nullptr;
 static lv_obj_t *lbl_fc[4]={nullptr,nullptr,nullptr,nullptr};   // 4-day forecast columns
-static lv_obj_t *photo_canvas=nullptr, *alert_overlay=nullptr, *lbl_alert_gluc=nullptr;
-static lv_color_t *photo_buf = nullptr;
 
 // Sparkline
 #define SPARK_POINTS 36   // ~3hr at 5min intervals
@@ -167,10 +147,7 @@ static bool      inSettings     = false;
 
 // Forward declarations
 void enterDashboard();
-void enterPhotoFrame();
 void fetchWeather();
-void nextPhoto();
-void prevPhoto();
 
 static SemaphoreHandle_t dataMutex;
 static int    glucose_val=0, glucose_delta=0;
@@ -180,7 +157,6 @@ static float gmi30=0, gmi90=0;          // estimated A1C (GMI %) over 30/90 days
 static volatile bool gmi_ready=false;
 struct FcDay { char dow[4]; int code, hi, lo; bool valid; };
 static FcDay forecast[4] = {};          // next 4 days (shared, dataMutex)
-static JPEGDEC jpeg;
 
 // ================================================================
 // Safe mode
@@ -652,7 +628,7 @@ void mqttEnsure(){            // every ~1s from fetchTask (Core 0): keepalive + 
     unsigned long now=millis();
     if(inited && (int32_t)(now-mqttLastTry)<5000)return;    // throttle reconnect
     mqttLastTry=now;
-    if(!inited){mqtt.setBufferSize(1024);inited=true;}      // HA discovery configs are big
+    if(!inited){mqtt.setBufferSize(512);inited=true;}       // HA discovery configs ~400B
     int port=cfg.mqttPort>0?cfg.mqttPort:1883;
     mqtt.setServer(mqttHostEff().c_str(),port);
     String node=mqttNodeId(), availT="glucoscout/"+node+"/status";
@@ -724,51 +700,6 @@ void fetchTask(void*p){
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-}
-
-// ================================================================
-// SD / Photos
-// ================================================================
-void scanPhotos(File dir){
-    while(photoCount<MAX_PHOTOS){
-        File f=dir.openNextFile();if(!f)break;
-        if(f.isDirectory()){scanPhotos(f);}
-        else{
-            String n=String(f.name());n.toLowerCase();
-            if(n.endsWith(".jpg")||n.endsWith(".jpeg")){
-                strncpy(photoPaths[photoCount],f.path(),63);photoCount++;
-            }
-        }
-        f.close();
-    }
-}
-int jpegCB(JPEGDRAW*p){
-    for(int y=0;y<p->iHeight;y++)for(int x=0;x<p->iWidth;x++){
-        int px=p->x+x,py=p->y+y;
-        if(px>=480||py>=320)continue;
-        uint16_t v=p->pPixels[y*p->iWidth+x];
-        photo_buf[py*480+px]=lv_color_make((v>>11)<<3,((v>>5)&0x3F)<<2,(v&0x1F)<<3);
-    }
-    return 1;
-}
-void showPhoto(const char*path){
-    if(!photo_buf||!photo_canvas)return;
-    File f=SD.open(path);if(!f)return;
-    size_t sz=f.size();
-    uint8_t*b=(uint8_t*)heap_caps_malloc(sz,MALLOC_CAP_SPIRAM);
-    if(!b)b=(uint8_t*)malloc(sz);
-    if(!b){f.close();return;}
-    f.read(b,sz);f.close();
-    memset(photo_buf,0,480*320*sizeof(lv_color_t));
-    if(jpeg.openRAM(b,sz,jpegCB)){
-        jpeg.setPixelType(RGB565_LITTLE_ENDIAN);jpeg.decode(0,0,0);jpeg.close();
-    }
-    free(b);lv_obj_invalidate(photo_canvas);
-}
-void rescanPhotos(){
-    photoCount=0;photoIndex=0;
-    File r=SD.open("/");scanPhotos(r);r.close();
-    Serial.println("Rescan: "+String(photoCount)+" photos");
 }
 
 // ================================================================
@@ -908,27 +839,6 @@ static void addSettingRow(lv_obj_t *parent,int idx,const char *label,int *value,
     lv_label_set_text(lp,"+");lv_obj_set_style_text_font(lp,&lv_font_montserrat_20,0);lv_obj_center(lp);
 }
 
-static void switchMode_cb(lv_event_t *e){
-    bool toDash=(currentMode==MODE_PHOTOFRAME);
-    if(settings_modal){lv_obj_del(settings_modal);settings_modal=nullptr;}
-    inSettings=false;
-    if(toDash)enterDashboard();
-    else if(sdAvailable&&photoCount>0)enterPhotoFrame();
-    else enterDashboard();
-}
-
-static void prevPhoto_cb(lv_event_t *e){
-    if(settings_modal){lv_obj_del(settings_modal);settings_modal=nullptr;}
-    inSettings=false;
-    prevPhoto();
-}
-
-static void nextPhoto_cb(lv_event_t *e){
-    if(settings_modal){lv_obj_del(settings_modal);settings_modal=nullptr;}
-    inSettings=false;
-    nextPhoto();
-}
-
 void showSettingsMenu(){
     if(inSettings||settings_modal)return;
     inSettings=true;
@@ -947,53 +857,10 @@ void showSettingsMenu(){
     lv_obj_set_style_text_font(t,&lv_font_montserrat_18,0);
     lv_obj_align(t,LV_ALIGN_TOP_MID,0,2);
 
-    // Switch View button at top
-    lv_obj_t *sw=lv_btn_create(settings_modal);
-    lv_obj_set_size(sw,460,32);
-    lv_obj_align(sw,LV_ALIGN_TOP_MID,0,28);
-    lv_obj_set_style_bg_color(sw,lv_color_hex(0x2980B9),0);
-    lv_obj_set_style_radius(sw,8,0);
-    lv_obj_add_event_cb(sw,switchMode_cb,LV_EVENT_CLICKED,NULL);
-    lv_obj_t *swl=lv_label_create(sw);
-    String swt=(currentMode==MODE_DASHBOARD)?"Switch to Photo Frame":"Switch to Dashboard (CGM)";
-    if(currentMode==MODE_PHOTOFRAME&&(!sdAvailable||photoCount==0))swt="Switch to Photo Frame";
-    lv_label_set_text(swl,swt.c_str());
-    lv_obj_set_style_text_color(swl,lv_color_hex(0xFFFFFF),0);
-    lv_obj_set_style_text_font(swl,&lv_font_montserrat_16,0);
-    lv_obj_center(swl);
-
-    int listY=64;
-    if(currentMode==MODE_PHOTOFRAME&&photoCount>1){
-        // Prev / Next photo buttons (photo mode only)
-        lv_obj_t *prv=lv_btn_create(settings_modal);
-        lv_obj_set_size(prv,224,30);
-        lv_obj_align(prv,LV_ALIGN_TOP_LEFT,5,64);
-        lv_obj_set_style_bg_color(prv,lv_color_hex(0x556677),0);
-        lv_obj_set_style_radius(prv,6,0);
-        lv_obj_add_event_cb(prv,prevPhoto_cb,LV_EVENT_CLICKED,NULL);
-        lv_obj_t *pl=lv_label_create(prv);
-        lv_label_set_text(pl,"<< Prev Photo");
-        lv_obj_set_style_text_color(pl,lv_color_hex(0xFFFFFF),0);
-        lv_obj_set_style_text_font(pl,&lv_font_montserrat_14,0);
-        lv_obj_center(pl);
-
-        lv_obj_t *nxt=lv_btn_create(settings_modal);
-        lv_obj_set_size(nxt,224,30);
-        lv_obj_align(nxt,LV_ALIGN_TOP_RIGHT,-5,64);
-        lv_obj_set_style_bg_color(nxt,lv_color_hex(0x556677),0);
-        lv_obj_set_style_radius(nxt,6,0);
-        lv_obj_add_event_cb(nxt,nextPhoto_cb,LV_EVENT_CLICKED,NULL);
-        lv_obj_t *nl=lv_label_create(nxt);
-        lv_label_set_text(nl,"Next Photo >>");
-        lv_obj_set_style_text_color(nl,lv_color_hex(0xFFFFFF),0);
-        lv_obj_set_style_text_font(nl,&lv_font_montserrat_14,0);
-        lv_obj_center(nl);
-
-        listY=100;
-    }
+    int listY=28;
 
     lv_obj_t *list=lv_obj_create(settings_modal);
-    lv_obj_set_size(list,470,(currentMode==MODE_PHOTOFRAME&&photoCount>1)?165:200);
+    lv_obj_set_size(list,470,235);
     lv_obj_set_pos(list,0,listY);
     lv_obj_set_style_bg_opa(list,LV_OPA_TRANSP,0);
     lv_obj_set_style_border_width(list,0,0);
@@ -1004,9 +871,8 @@ void showSettingsMenu(){
     gSettingCount=0;
     addSettingRow(list,0,"Day Brightness",&cfg.dayBright,10,100,5,"%");
     addSettingRow(list,1,"Night Brightness",&cfg.nightBright,5,100,5,"%");
-    addSettingRow(list,2,"Photo Cycle Time",&cfg.photoMs,3,120,1,"sec");
-    addSettingRow(list,3,"Critical Low",&cfg.critLow,40,100,5,"");
-    addSettingRow(list,4,"Critical High",&cfg.critHigh,150,400,10,"");
+    addSettingRow(list,2,"Critical Low",&cfg.critLow,40,100,5,"");
+    addSettingRow(list,3,"Critical High",&cfg.critHigh,150,400,10,"");
 
     lv_obj_t *btn=lv_btn_create(settings_modal);
     lv_obj_set_size(btn,460,38);
@@ -1025,17 +891,6 @@ void showSettingsMenu(){
 
 static void screenLongPress_cb(lv_event_t *e){
     if(!inSettings)showSettingsMenu();
-}
-
-static void screenGesture_cb(lv_event_t *e){
-    if(inSettings)return;
-    lv_indev_t *indev=lv_indev_get_act();
-    if(!indev)return;
-    lv_dir_t dir=lv_indev_get_gesture_dir(indev);
-    if(currentMode==MODE_PHOTOFRAME){
-        if(dir==LV_DIR_LEFT)nextPhoto();
-        else if(dir==LV_DIR_RIGHT)prevPhoto();
-    }
 }
 
 // ================================================================
@@ -1151,30 +1006,6 @@ void createDashboardUI(){
 }
 
 // ================================================================
-// LVGL Photo Frame UI
-// ================================================================
-void createPhotoFrameUI(){
-    lv_obj_t*scr=lv_scr_act();
-    lv_obj_set_style_bg_color(scr,lv_color_hex(0x000000),0);
-    lv_obj_set_style_bg_opa(scr,LV_OPA_COVER,0);
-    photo_canvas=lv_canvas_create(scr);
-    lv_canvas_set_buffer(photo_canvas,photo_buf,480,320,LV_IMG_CF_TRUE_COLOR);
-    lv_obj_set_pos(photo_canvas,0,0);
-    alert_overlay=lv_obj_create(scr);
-    lv_obj_set_size(alert_overlay,480,320);lv_obj_set_pos(alert_overlay,0,0);
-    lv_obj_set_style_bg_color(alert_overlay,lv_color_hex(0xFF0000),0);
-    lv_obj_set_style_bg_opa(alert_overlay,LV_OPA_40,0);
-    lv_obj_set_style_border_width(alert_overlay,0,0);
-    lv_obj_clear_flag(alert_overlay,LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(alert_overlay,LV_OBJ_FLAG_HIDDEN);
-    lbl_alert_gluc=lv_label_create(scr);lv_label_set_text(lbl_alert_gluc,"");
-    lv_obj_set_style_text_color(lbl_alert_gluc,lv_color_hex(0xFFFFFF),0);
-    lv_obj_set_style_text_font(lbl_alert_gluc,&lv_font_montserrat_48,0);
-    lv_obj_align(lbl_alert_gluc,LV_ALIGN_CENTER,0,0);
-    lv_obj_add_flag(lbl_alert_gluc,LV_OBJ_FLAG_HIDDEN);
-}
-
-// ================================================================
 // UI updates
 // ================================================================
 void updateDashboardUI(){
@@ -1209,55 +1040,13 @@ void updateDashboardUI(){
         lv_label_set_text(lbl_status,b);
     }
 }
-void updatePhotoAlert(){
-    if(!alert_overlay||!lbl_alert_gluc)return;
-    xSemaphoreTake(dataMutex,portMAX_DELAY);int gv=glucose_val;xSemaphoreGive(dataMutex);
-    if(isCritical(gv)){
-        lv_label_set_text(lbl_alert_gluc,(String(gv)+(gv<cfg.critLow?"\n  LOW!":"\n HIGH!")).c_str());
-        lv_obj_clear_flag(alert_overlay,LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(lbl_alert_gluc,LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(alert_overlay,LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(lbl_alert_gluc,LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
 // ================================================================
-// Mode switching
+// Dashboard entry
 // ================================================================
 void enterDashboard(){
-    currentMode=MODE_DASHBOARD;modeTimer=millis();
-    photo_canvas=nullptr;alert_overlay=nullptr;lbl_alert_gluc=nullptr;spark_canvas=nullptr;
-    bsp_display_lock(100);lv_obj_clean(lv_scr_act());
-    createDashboardUI();updateDashboardUI();bsp_display_unlock();
-}
-void enterPhotoFrame(){
-    if(!sdAvailable||photoCount==0||!photo_buf){modeTimer=millis();return;}
-    currentMode=MODE_PHOTOFRAME;photoTimer=millis();
     spark_canvas=nullptr;
     bsp_display_lock(100);lv_obj_clean(lv_scr_act());
-    createPhotoFrameUI();showPhoto(photoPaths[photoIndex]);updatePhotoAlert();
-    bsp_display_unlock();
-}
-void nextPhoto(){
-    if(!sdAvailable||photoCount==0)return;
-    photoIndex=(photoIndex+1)%photoCount;
-    photoTimer=millis();
-    if(currentMode==MODE_PHOTOFRAME&&bsp_display_lock(100)){
-        showPhoto(photoPaths[photoIndex]);
-        updatePhotoAlert();
-        bsp_display_unlock();
-    }
-}
-void prevPhoto(){
-    if(!sdAvailable||photoCount==0)return;
-    photoIndex=(photoIndex-1+photoCount)%photoCount;
-    photoTimer=millis();
-    if(currentMode==MODE_PHOTOFRAME&&bsp_display_lock(100)){
-        showPhoto(photoPaths[photoIndex]);
-        updatePhotoAlert();
-        bsp_display_unlock();
-    }
+    createDashboardUI();updateDashboardUI();bsp_display_unlock();
 }
 void applyBrightness(int h){
     bool n=(h>=cfg.nightStart&&h<cfg.nightEnd);
@@ -1267,8 +1056,12 @@ void applyBrightness(int h){
 // ================================================================
 // Config page HTML
 // ================================================================
-String buildConfigPage(){
-    String html=R"HTML(<!DOCTYPE html>
+// Streamed in chunks (chunked transfer) so the whole ~7KB page is never held
+// in internal RAM at once — only the largest single static chunk is transient.
+void streamConfigPage(){
+    configServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    configServer.send(200,"text/html","");
+    configServer.sendContent(R"HTML(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CGM Config</title>
@@ -1299,99 +1092,106 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
 </style></head><body>
 <h1>&#127973; CGM Dashboard</h1>
 <p class="sub">Settings saved to device — survive reboot</p>
-<nav><a href="/" class="active">Settings</a><a href="/files">Photos</a></nav>
+<nav><a href="/" class="active">Settings</a></nav>
 <div class="toast" id="toast"></div>
 <form id="frm">
 <div class="card"><h2>Brightness</h2>
 <div class="row"><label>Day brightness<small>Normal hours</small></label>
-<input type="number" name="dayBright" min="10" max="100" value=")HTML";
-    html+=String(cfg.dayBright);
-    html+=R"HTML("><span class="unit">%</span></div>
+<input type="number" name="dayBright" min="10" max="100" value=")HTML");
+    configServer.sendContent(String(cfg.dayBright));
+    configServer.sendContent(R"HTML("><span class="unit">%</span></div>
 <div class="row"><label>Night brightness<small>Dim during night mode</small></label>
-<input type="number" name="nightBright" min="5" max="100" value=")HTML";
-    html+=String(cfg.nightBright);
-    html+=R"HTML("><span class="unit">%</span></div></div>
+<input type="number" name="nightBright" min="5" max="100" value=")HTML");
+    configServer.sendContent(String(cfg.nightBright));
+    configServer.sendContent(R"HTML("><span class="unit">%</span></div></div>
 <div class="card"><h2>Night Mode Hours</h2>
 <div class="row"><label>Dim at hour<small>24-hour (1 = 1:00 AM)</small></label>
-<input type="number" name="nightStart" min="0" max="23" value=")HTML";
-    html+=String(cfg.nightStart);
-    html+=R"HTML("><span class="unit">hr</span></div>
+<input type="number" name="nightStart" min="0" max="23" value=")HTML");
+    configServer.sendContent(String(cfg.nightStart));
+    configServer.sendContent(R"HTML("><span class="unit">hr</span></div>
 <div class="row"><label>Brighten at hour<small>24-hour (7 = 7:00 AM)</small></label>
-<input type="number" name="nightEnd" min="0" max="23" value=")HTML";
-    html+=String(cfg.nightEnd);
-    html+=R"HTML("><span class="unit">hr</span></div></div>
+<input type="number" name="nightEnd" min="0" max="23" value=")HTML");
+    configServer.sendContent(String(cfg.nightEnd));
+    configServer.sendContent(R"HTML("><span class="unit">hr</span></div></div>
 <div class="card"><h2>Display Timing</h2>
 <div class="row"><label>Dashboard time<small>How long dashboard shows</small></label>
-<input type="number" name="dashboardSec" min="3" max="120" value=")HTML";
-    html+=String(cfg.dashboardMs/1000);
-    html+=R"HTML("><span class="unit">sec</span></div>
-<div class="row"><label>Photo time<small>How long each photo shows</small></label>
-<input type="number" name="photoSec" min="3" max="120" value=")HTML";
-    html+=String(cfg.photoMs/1000);
-    html+=R"HTML("><span class="unit">sec</span></div></div>
+<input type="number" name="dashboardSec" min="3" max="120" value=")HTML");
+    configServer.sendContent(String(cfg.dashboardMs/1000));
+    configServer.sendContent(R"HTML("><span class="unit">sec</span></div></div>
 <div class="card"><h2>Glucose Alert Thresholds</h2>
 <div class="row"><label>Critical LOW<small>Red flash + LOW! overlay</small></label>
-<input type="number" name="critLow" min="40" max="100" value=")HTML";
-    html+=String(cfg.critLow);
-    html+=R"HTML("><span class="unit">mg/dL</span></div>
+<input type="number" name="critLow" min="40" max="100" value=")HTML");
+    configServer.sendContent(String(cfg.critLow));
+    configServer.sendContent(R"HTML("><span class="unit">mg/dL</span></div>
 <div class="row"><label>Critical HIGH<small>Red flash + HIGH! overlay</small></label>
-<input type="number" name="critHigh" min="150" max="400" value=")HTML";
-    html+=String(cfg.critHigh);
-    html+=R"HTML("><span class="unit">mg/dL</span></div></div>
+<input type="number" name="critHigh" min="150" max="400" value=")HTML");
+    configServer.sendContent(String(cfg.critHigh));
+    configServer.sendContent(R"HTML("><span class="unit">mg/dL</span></div></div>
 <div class="card"><h2>Glucose Source</h2>
 <div class="row"><label>Data source<small>Where glucose readings come from</small></label>
 <select name="cgmSource" id="cgmSource" onchange="srcChange()" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem">
-<option value="0")HTML"; if(cfg.cgmSource==0)html+=" selected"; html+=R"HTML(>Nightscout</option>
-<option value="1")HTML"; if(cfg.cgmSource==1)html+=" selected"; html+=R"HTML(>Dexcom Share</option>
-<option value="2")HTML"; if(cfg.cgmSource==2)html+=" selected"; html+=R"HTML(>LibreLinkUp</option>
+<option value="0")HTML");
+    if(cfg.cgmSource==0)configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>Nightscout</option>
+<option value="1")HTML");
+    if(cfg.cgmSource==1)configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>Dexcom Share</option>
+<option value="2")HTML");
+    if(cfg.cgmSource==2)configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>LibreLinkUp</option>
 </select></div>
-<div id="ns_fields"><div class="row"><label>Nightscout URL</label><input type="text" name="nsurl" style="width:210px;text-align:left" value=")HTML";
-    html+=nsUrl();
-    html+=R"HTML("></div><div class="row"><label>Nightscout secret<small>blank = keep</small></label><input type="password" name="nssecret" placeholder="(unchanged)" style="width:140px"></div></div>
+<div id="ns_fields"><div class="row"><label>Nightscout URL</label><input type="text" name="nsurl" style="width:210px;text-align:left" value=")HTML");
+    configServer.sendContent(nsUrl());
+    configServer.sendContent(R"HTML("></div><div class="row"><label>Nightscout secret<small>blank = keep</small></label><input type="password" name="nssecret" placeholder="(unchanged)" style="width:140px"></div></div>
 <div id="dex_fields" style="display:none">
-<div class="row"><label>Dexcom username</label><input type="text" name="dexUser" style="width:160px;text-align:left" value=")HTML";
-    html+=cfg.dexUser;
-    html+=R"HTML("></div>
+<div class="row"><label>Dexcom username</label><input type="text" name="dexUser" style="width:160px;text-align:left" value=")HTML");
+    configServer.sendContent(cfg.dexUser);
+    configServer.sendContent(R"HTML("></div>
 <div class="row"><label>Dexcom password<small>blank = keep current</small></label><input type="password" name="dexPass" placeholder="(unchanged)" style="width:140px"></div>
-<div class="row"><label>Region</label><select name="dexRegion" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px"><option value="us")HTML"; if(cfg.dexRegion!="ous")html+=" selected"; html+=R"HTML(>US</option><option value="ous")HTML"; if(cfg.dexRegion=="ous")html+=" selected"; html+=R"HTML(>Outside US</option></select></div>
+<div class="row"><label>Region</label><select name="dexRegion" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px"><option value="us")HTML");
+    if(cfg.dexRegion!="ous")configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>US</option><option value="ous")HTML");
+    if(cfg.dexRegion=="ous")configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>Outside US</option></select></div>
 </div>
 <div id="lib_fields" style="display:none">
-<div class="row"><label>Libre email</label><input type="text" name="libUser" style="width:160px;text-align:left" value=")HTML";
-    html+=cfg.libUser;
-    html+=R"HTML("></div>
+<div class="row"><label>Libre email</label><input type="text" name="libUser" style="width:160px;text-align:left" value=")HTML");
+    configServer.sendContent(cfg.libUser);
+    configServer.sendContent(R"HTML("></div>
 <div class="row"><label>Libre password<small>blank = keep current</small></label><input type="password" name="libPass" placeholder="(unchanged)" style="width:140px"></div>
-<div class="row"><label>Region<small>us / eu / de / fr ...</small></label><input type="text" name="libRegion" maxlength="6" style="width:80px" value=")HTML";
-    html+=cfg.libRegion;
-    html+=R"HTML("></div>
+<div class="row"><label>Region<small>us / eu / de / fr ...</small></label><input type="text" name="libRegion" maxlength="6" style="width:80px" value=")HTML");
+    configServer.sendContent(cfg.libRegion);
+    configServer.sendContent(R"HTML("></div>
 </div></div>
 <div class="card"><h2>Weather Location</h2>
 <div class="row"><label>City label<small>Shows on dashboard header</small></label>
-<input type="text" name="city" maxlength="30" style="width:140px;text-align:left" value=")HTML";
-    html+=cfg.city;
-    html+=R"HTML("></div>
+<input type="text" name="city" maxlength="30" style="width:140px;text-align:left" value=")HTML");
+    configServer.sendContent(cfg.city);
+    configServer.sendContent(R"HTML("></div>
 <div class="row"><label>Latitude<small>Decimal, e.g. 40.7128</small></label>
-<input type="text" name="lat" maxlength="12" style="width:100px" value=")HTML";
-    html+=cfg.lat;
-    html+=R"HTML("></div>
+<input type="text" name="lat" maxlength="12" style="width:100px" value=")HTML");
+    configServer.sendContent(cfg.lat);
+    configServer.sendContent(R"HTML("></div>
 <div class="row"><label>Longitude<small>Decimal, e.g. -74.0060</small></label>
-<input type="text" name="lon" maxlength="12" style="width:100px" value=")HTML";
-    html+=cfg.lon;
-    html+=R"HTML("></div>
+<input type="text" name="lon" maxlength="12" style="width:100px" value=")HTML");
+    configServer.sendContent(cfg.lon);
+    configServer.sendContent(R"HTML("></div>
 <div class="row"><label>Temperature unit<small>F or C</small></label>
-<select name="units" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem"><option value="F")HTML";
-    if(!cfg.isCelsius)html+=" selected";
-    html+=R"HTML(>Fahrenheit</option><option value="C")HTML";
-    if(cfg.isCelsius)html+=" selected";
-    html+=R"HTML(>Celsius</option></select></div>
+<select name="units" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem"><option value="F")HTML");
+    if(!cfg.isCelsius)configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>Fahrenheit</option><option value="C")HTML");
+    if(cfg.isCelsius)configServer.sendContent(" selected");
+    configServer.sendContent(R"HTML(>Celsius</option></select></div>
 <div class="row"><label>Lookup by city name<small>Auto-fills lat/lon</small></label>
 <button type="button" class="br" style="padding:7px 14px;font-size:.85rem" onclick="lookupCity()">Find Coords</button></div></div>
 <div class="card"><h2>Time Zone</h2>
 <div class="row"><label>Region<small>Auto-handles DST</small></label>
-<select name="tz" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem;max-width:220px">)HTML";
+<select name="tz" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem;max-width:220px">)HTML");
     auto tzOpt=[&](const char* val,const char* lbl){
-        html+="<option value=\"";html+=val;html+="\"";
-        if(cfg.tzString==val)html+=" selected";
-        html+=">";html+=lbl;html+="</option>";
+        String o="<option value=\"";o+=val;o+="\"";
+        if(cfg.tzString==val)o+=" selected";
+        o+=">";o+=lbl;o+="</option>";
+        configServer.sendContent(o);
     };
     tzOpt("EST5EDT,M3.2.0,M11.1.0","US Eastern");
     tzOpt("CST6CDT,M3.2.0,M11.1.0","US Central");
@@ -1412,17 +1212,14 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
     tzOpt("AEST-10AEDT,M10.1.0,M4.1.0/3","Australia (Sydney)");
     tzOpt("NZST-12NZDT,M9.5.0,M4.1.0/3","New Zealand");
     tzOpt("UTC0","UTC");
-    html+=R"HTML(</select></div></div>
+    configServer.sendContent(R"HTML(</select></div></div>
 <div class="brow">
 <button class="bs" type="button" onclick="doSave()">Save Settings</button>
 <button class="br" type="button" onclick="doRestart()">Restart Board</button>
-</div>
-<div class="brow" style="margin-top:8px">
-<button type="button" onclick="toggleMode()" style="flex:1;border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-weight:700;cursor:pointer;background:#2980b9;color:#fff">Switch View (CGM &harr; Photos)</button>
 </div></form>
-<p class="ip">CGM-Dashboard &#8226; )HTML";
-    html+=WiFi.localIP().toString();
-    html+=R"HTML(</p>
+<p class="ip">CGM-Dashboard &#8226; )HTML");
+    configServer.sendContent(WiFi.localIP().toString());
+    configServer.sendContent(R"HTML(</p>
 <script>
 var toast=document.getElementById("toast");
 function showToast(m,e){toast.textContent=m;toast.className="toast"+(e?" err":"");
@@ -1439,11 +1236,6 @@ function doSave(){
 function doRestart(){
   if(!confirm("Restart the board now?"))return;
   fetch("/restart",{method:"POST"});showToast("Restarting...");}
-function toggleMode(){
-  fetch("/togglemode",{method:"POST"}).then(function(r){
-    if(r.ok)return r.text();throw new Error();})
-    .then(function(t){showToast("Now showing: "+t);})
-    .catch(function(){showToast("Switch failed (no photos?)",true);});}
 function lookupCity(){
   var name=prompt("Enter city name (e.g. 'New York' or 'Paris, France'):");
   if(!name)return;
@@ -1457,140 +1249,14 @@ function lookupCity(){
       document.querySelector('input[name=city]').value=(hit.name+(hit.admin1?", "+hit.admin1:""));
       showToast("Found: "+hit.name+", "+hit.country+" - hit Save to apply");
     }).catch(function(){showToast("Lookup failed",true);});}
-</script></body></html>)HTML";
-    return html;
+</script></body></html>)HTML");
+    configServer.sendContent("");   // terminate chunked response
 }
-
-// ================================================================
-// Photos page — stored in PROGMEM (flash), served directly
-// ================================================================
-const char UPLOAD_PAGE[] PROGMEM = R"ZHTML(<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CGM Photos</title>
-<style>
-:root{--bg:#f5f5f5;--card:#fff;--accent:#e74c3c;--a2:#c0392b;--text:#222;--muted:#666;--border:#ddd;--green:#27ae60;--blue:#2980b9;--r:12px}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);padding:16px}
-h1{font-size:1.3rem;color:var(--accent);margin-bottom:4px}
-.sub{font-size:.8rem;color:var(--muted);margin-bottom:18px}
-nav{display:flex;gap:8px;margin-bottom:18px}
-nav a{display:inline-block;padding:8px 14px;border-radius:8px;font-size:.85rem;font-weight:700;text-decoration:none;background:var(--card);color:var(--muted);border:1px solid var(--border)}
-nav a.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-.card{background:var(--card);border-radius:var(--r);box-shadow:0 1px 4px rgba(0,0,0,.1);padding:16px;margin-bottom:14px}
-.card h2{font-size:.8rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
-.bbar{display:flex;align-items:center;gap:8px;background:#f0f4f8;border-radius:8px;padding:8px 12px;margin-bottom:10px;flex-wrap:wrap}
-#bc{flex:1;font-size:.85rem;color:var(--text);word-break:break-all}
-#bc span{cursor:pointer;color:var(--blue);font-weight:600}
-#bc span:hover{text-decoration:underline}
-.bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;max-height:180px;overflow-y:auto;margin-bottom:10px}
-.fi{display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:.82rem;background:#fff;transition:all .15s}
-.fi:hover{background:#dbeeff;border-color:var(--blue)}
-.mkrow{display:flex;gap:8px}
-.mkrow input{flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:8px;font-size:.85rem}
-.btn{border:none;border-radius:9px;padding:10px 16px;font-size:.9rem;font-weight:700;cursor:pointer}
-.bg{background:#eee;color:#333}.bb{background:var(--blue);color:#fff}
-.fli{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);font-size:.82rem}
-.fli:last-child{border-bottom:none}
-.flt{width:32px;height:32px;object-fit:cover;border-radius:5px;background:var(--border);flex-shrink:0}
-.fln{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.fls{color:var(--muted);font-size:.72rem;white-space:nowrap}
-.fld{background:var(--accent);border:none;color:#fff;cursor:pointer;font-size:.72rem;font-weight:700;padding:5px 10px;border-radius:6px;white-space:nowrap}
-.fld:hover{background:var(--a2)}
-.sdbar{background:#f0f4f8;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:.82rem;display:flex;align-items:center;gap:10px}
-.sdtxt{font-weight:600;color:var(--text);white-space:nowrap;min-width:130px}
-.sdtrk{flex:1;height:8px;background:var(--border);border-radius:4px;overflow:hidden}
-.sdfil{height:100%;background:var(--blue);transition:width .3s}
-.sdfil.warn{background:#e67e22}.sdfil.hi{background:var(--accent)}
-.empty{color:var(--muted);font-size:.82rem;font-style:italic}
-#toast{display:none;background:var(--green);color:#fff;text-align:center;padding:9px 14px;border-radius:9px;margin-bottom:12px;font-weight:700;font-size:.85rem}
-#toast.err{background:var(--accent)}
-</style></head><body>
-<h1>&#128247; CGM Dashboard</h1>
-<p class="sub">Browse SD card, manage folders, delete photos</p>
-<nav><a href="/">Settings</a><a href="/files" class="active">Photos</a></nav>
-<div id="toast"></div>
-<div class="card"><h2>SD Card &#8212; Browse</h2>
-<div class="sdbar"><span class="sdtxt" id="sdtxt">SD: loading...</span><div class="sdtrk"><div class="sdfil" id="sdfil" style="width:0%"></div></div></div>
-<div class="bbar"><span>&#128193;</span><div id="bc"></div>
-<button class="btn bg" style="padding:5px 10px;font-size:.8rem;flex:none" onclick="navUp()">&#8593; Up</button></div>
-<div class="bgrid" id="fgrid"><p class="empty" style="grid-column:1/-1">Loading...</p></div>
-<div class="mkrow"><input type="text" id="mname" placeholder="New folder name...">
-<button class="btn bb" onclick="mkDir()">&#10010; New Folder</button></div></div>
-<div class="card"><h2>Photos in Selected Folder</h2>
-<div id="flist"><p class="empty">Loading...</p></div></div>
-<script>
-var curPath='/';
-function showToast(m,e){var t=document.getElementById('toast');t.textContent=m;t.className=e?'err':'';t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
-function setBc(path){var bc=document.getElementById('bc');bc.innerHTML='';var r=document.createElement('span');r.textContent='/ root';r.onclick=function(){browse('/');};bc.appendChild(r);var parts=path.split('/').filter(function(x){return x!='';});var built='';for(var i=0;i<parts.length;i++){built+='/'+parts[i];bc.appendChild(document.createTextNode(' / '));var s=document.createElement('span');s.textContent=parts[i];(function(p){s.onclick=function(){browse(p);};})(built);bc.appendChild(s);}}
-function fmtMB(m){return m>=1024?(m/1024).toFixed(1)+' GB':m+' MB';}
-function updateSD(d){if(!d.totalMB)return;var pct=Math.round(d.usedMB/d.totalMB*100);var free=d.totalMB-d.usedMB;document.getElementById('sdtxt').textContent=fmtMB(d.usedMB)+' / '+fmtMB(d.totalMB)+' ('+pct+'%) - '+fmtMB(free)+' free';var f=document.getElementById('sdfil');f.style.width=pct+'%';f.className='sdfil'+(pct>=90?' hi':pct>=75?' warn':'');}
-function browse(path){curPath=path;setBc(path);var g=document.getElementById('fgrid');g.innerHTML='<p class="empty" style="grid-column:1/-1">Loading...</p>';fetch('/browse?path='+encodeURIComponent(path)).then(function(r){return r.json();}).then(function(data){updateSD(data);g.innerHTML='';if(data.dirs.length==0){g.innerHTML='<p class="empty" style="grid-column:1/-1">No sub-folders</p>';}for(var i=0;i<data.dirs.length;i++){var d=data.dirs[i];var div=document.createElement('div');div.className='fi';var ico=document.createElement('span');ico.textContent='[DIR] ';var nm=document.createElement('span');nm.textContent=d;div.appendChild(ico);div.appendChild(nm);var sub=(path=='/'?'':path)+'/'+d;(function(sp){div.onclick=function(){browse(sp.replace('//','/')); };})(sub);g.appendChild(div);}loadFiles(path);}).catch(function(){g.innerHTML='<p class="empty" style="color:#e74c3c;grid-column:1/-1">Browse failed</p>';});}
-function navUp(){if(curPath=='/')return;var p=curPath.split('/').filter(function(x){return x!='';});p.pop();browse(p.length==0?'/':'/'+p.join('/'));}
-function mkDir(){var name=document.getElementById('mname').value.trim();if(!name)return;var full=(curPath=='/'?'':curPath)+'/'+name;fetch('/mkdir',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+encodeURIComponent(full.replace('//','/'))}).then(function(r){if(r.ok){document.getElementById('mname').value='';showToast('Created: '+name);browse(curPath);}else showToast('Failed',true);});}
-function loadFiles(path){fetch('/filelist?path='+encodeURIComponent(path||curPath)).then(function(r){return r.json();}).then(function(files){var div=document.getElementById('flist');if(!files.length){div.innerHTML='<p class="empty">No photos here</p>';return;}var s='';for(var i=0;i<files.length;i++){var f=files[i];s+='<div class="fli"><img class="flt" src="/photo?name='+encodeURIComponent(f.path)+'"><span class="fln">'+f.name+'</span><span class="fls">'+(f.size/1024).toFixed(0)+' KB</span><button class="fld" onclick="delFile(this)" data-p="'+f.path+'">&#128465; Delete</button></div>';}div.innerHTML=s;});}
-function delFile(btn){var fp=btn.dataset.p;if(!confirm('Delete '+fp.split('/').pop()+'?'))return;fetch('/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+encodeURIComponent(fp)}).then(function(r){if(r.ok){showToast('Deleted');loadFiles(curPath);}else showToast('Delete failed',true);});}
-document.getElementById('mname').addEventListener('keydown',function(e){if(e.key=='Enter')mkDir();});
-browse('/');
-</script></body></html>)ZHTML";
-
-String buildUploadPage() {
-    return String(FPSTR(UPLOAD_PAGE));
-}
-
 
 // ================================================================
 // Web Server handlers
 // ================================================================
-void handleRoot()      { configServer.send(200,"text/html",buildConfigPage()); }
-void handleFilesPage() { configServer.send(200,"text/html",buildUploadPage()); }
-
-void handleFileList(){
-    String path=configServer.hasArg("path")?configServer.arg("path"):"/";
-    if(!path.startsWith("/"))path="/"+path;
-    String json="[";bool first=true;
-    File dir=SD.open(path.c_str());
-    if(dir){while(true){
-        File e=dir.openNextFile();if(!e)break;
-        String n=String(e.name()),lo=n;lo.toLowerCase();
-        if(!e.isDirectory()&&(lo.endsWith(".jpg")||lo.endsWith(".jpeg"))){
-            String fp=(path=="/"?"":path)+"/"+n;fp.replace("//","/");
-            if(!first)json+=",";
-            json+="{\"name\":\""+n+"\",\"path\":\""+fp+"\",\"size\":"+String(e.size())+"}";
-            first=false;
-        }
-        e.close();
-    }dir.close();}
-    configServer.send(200,"application/json",json+"]");
-}
-
-void handleBrowse(){
-    String path=configServer.hasArg("path")?configServer.arg("path"):"/";
-    if(!path.startsWith("/"))path="/"+path;
-    File dir=SD.open(path.c_str());
-    if(!dir||!dir.isDirectory()){configServer.send(400,"application/json","{\"error\":\"Not a dir\"}");return;}
-    String dirs="",files="";bool fD=true,fF=true;
-    while(true){
-        File e=dir.openNextFile();if(!e)break;
-        String n=String(e.name()),lo=n;lo.toLowerCase();
-        if(e.isDirectory()){if(!fD)dirs+=",";dirs+="\""+n+"\"";fD=false;}
-        else if(lo.endsWith(".jpg")||lo.endsWith(".jpeg")){if(!fF)files+=",";files+="\""+n+"\"";fF=false;}
-        e.close();
-    }
-    dir.close();
-    uint32_t totMB=(uint32_t)(SD.totalBytes()/(1024ULL*1024ULL));
-    uint32_t usedMB=(uint32_t)(SD.usedBytes()/(1024ULL*1024ULL));
-    String resp="{\"path\":\""+path+"\",\"dirs\":["+dirs+"],\"files\":["+files+"]";
-    resp+=",\"totalMB\":"+String(totMB)+",\"usedMB\":"+String(usedMB)+"}";
-    configServer.send(200,"application/json",resp);
-}
-
-void handleMkdir(){
-    if(!configServer.hasArg("path")){configServer.send(400,"text/plain","Missing path");return;}
-    String path=configServer.arg("path");
-    if(!path.startsWith("/"))path="/"+path;
-    SD.mkdir(path.c_str())?configServer.send(200,"text/plain","OK"):configServer.send(500,"text/plain","Failed");
-}
+void handleRoot() { streamConfigPage(); }
 
 void handleSave(){
     bool changed=false;
@@ -1601,7 +1267,6 @@ void handleSave(){
     ga("nightStart",cfg.nightStart,0,23);ga("nightEnd",cfg.nightEnd,0,23);
     ga("critLow",cfg.critLow,40,100);ga("critHigh",cfg.critHigh,150,400);
     if(configServer.hasArg("dashboardSec")){int v=configServer.arg("dashboardSec").toInt();if(v>=3&&v<=120){cfg.dashboardMs=v*1000;changed=true;}}
-    if(configServer.hasArg("photoSec")){int v=configServer.arg("photoSec").toInt();if(v>=3&&v<=120){cfg.photoMs=v*1000;changed=true;}}
     if(configServer.hasArg("lat")){
         String v=configServer.arg("lat");float f=v.toFloat();
         if(f>=-90.0&&f<=90.0&&v.length()<=12){cfg.lat=v;changed=true;}
@@ -1649,35 +1314,7 @@ void handleSave(){
     else configServer.send(400,"text/plain","No valid parameters");
 }
 
-void handleDelete(){
-    String path="";
-    if(configServer.hasArg("path"))path=configServer.arg("path");
-    else if(configServer.hasArg("name"))path="/"+configServer.arg("name");
-    if(path.isEmpty()){configServer.send(400,"text/plain","Missing path");return;}
-    if(!path.startsWith("/"))path="/"+path;
-    String lo=path;lo.toLowerCase();
-    if(!lo.endsWith(".jpg")&&!lo.endsWith(".jpeg")){configServer.send(400,"text/plain","JPG only");return;}
-    if(SD.exists(path.c_str())){
-        SD.remove(path.c_str());rescanPhotos();configServer.send(200,"text/plain","OK");
-    } else configServer.send(404,"text/plain","Not found");
-}
-
-void handlePhoto(){
-    String path="";if(configServer.hasArg("name"))path=configServer.arg("name");
-    if(!path.startsWith("/"))path="/"+path;
-    if(!SD.exists(path.c_str())){configServer.send(404,"text/plain","Not found");return;}
-    File f=SD.open(path.c_str());configServer.streamFile(f,"image/jpeg");f.close();
-}
 void handleRestart(){configServer.send(200,"text/plain","Restarting...");delay(500);ESP.restart();}
-void handleToggleMode(){
-    if(currentMode==MODE_DASHBOARD){
-        if(sdAvailable&&photoCount>0){enterPhotoFrame();configServer.send(200,"text/plain","Photo Frame");}
-        else configServer.send(400,"text/plain","No photos on SD");
-    } else {
-        enterDashboard();
-        configServer.send(200,"text/plain","Dashboard");
-    }
-}
 void handleNotFound(){configServer.send(404,"text/plain","Not found");}
 
 void startConfigServer(){
@@ -1686,13 +1323,6 @@ void startConfigServer(){
     configServer.on("/otacheck", HTTP_POST, handleOtaCheck);
     configServer.on("/otastatus",HTTP_GET,  handleOtaStatus);
     configServer.on("/restart",  HTTP_POST, handleRestart);
-    configServer.on("/togglemode", HTTP_POST, handleToggleMode);
-    configServer.on("/files",    HTTP_GET,  handleFilesPage);
-    configServer.on("/filelist", HTTP_GET,  handleFileList);
-    configServer.on("/browse",   HTTP_GET,  handleBrowse);
-    configServer.on("/mkdir",    HTTP_POST, handleMkdir);
-    configServer.on("/delete",   HTTP_POST, handleDelete);
-    configServer.on("/photo",    HTTP_GET,  handlePhoto);
     configServer.onNotFound(handleNotFound);
     configServer.begin();
     Serial.print("[WebServer] http://");Serial.println(WiFi.localIP());
@@ -1706,13 +1336,6 @@ void setup(){
     prefs.begin("boot",false);
     int cc=prefs.getInt("crashes",0)+1;prefs.putInt("crashes",cc);prefs.end();
     dataMutex=xSemaphoreCreateMutex();
-    photo_buf=(lv_color_t*)heap_caps_malloc(480*320*sizeof(lv_color_t),MALLOC_CAP_SPIRAM);
-    if(photo_buf)memset(photo_buf,0,480*320*sizeof(lv_color_t));
-    sdSPI.begin(SD_CLK,SD_MISO,SD_MOSI,SD_CS);
-    if(SD.begin(SD_CS,sdSPI)){
-        sdAvailable=true;File r=SD.open("/");scanPhotos(r);r.close();
-        Serial.println("Photos: "+String(photoCount));
-    }
     bsp_display_cfg_t dcfg={.lvgl_port_cfg=ESP_LVGL_PORT_INIT_CONFIG(),.buffer_size=320*480,.rotate=LV_DISP_ROT_90};
     bsp_display_start_with_config(&dcfg);bsp_display_brightness_set(100);
     bsp_display_lock(100);
@@ -1741,14 +1364,10 @@ void setup(){
     applyTimezone();
     bsp_display_lock(100);lv_obj_clean(lv_scr_act());createDashboardUI();
     lv_obj_add_event_cb(lv_scr_act(),screenLongPress_cb,LV_EVENT_LONG_PRESSED,NULL);
-    lv_obj_add_event_cb(lv_scr_act(),screenGesture_cb,LV_EVENT_GESTURE,NULL);
     bsp_display_unlock();
     fetchGlucose();fetchWeather();
     bsp_display_lock(100);updateDashboardUI();bsp_display_unlock();
-    modeTimer=millis();
     xTaskCreatePinnedToCore(fetchTask,"fetchTask",16384,NULL,1,NULL,0);
-    // Boot into the dashboard (glucose first); photo frame is opt-in
-    // via long-press Settings -> "Switch to Photo Frame" or the web page.
     prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.end();
     Serial.println("Boot OK");
     esp_task_wdt_config_t wc={.timeout_ms=30000,.idle_core_mask=0,.trigger_panic=true};
@@ -1777,21 +1396,14 @@ void loop(){
             delay(200);ESP.restart();
         }
     }
-    if(!inSettings){
-        if(currentMode==MODE_PHOTOFRAME){
-            if((unsigned long)(now-photoTimer)>=(unsigned long)cfg.photoMs)nextPhoto();
-        }
-    } else {
-        modeTimer=now;  // keep resetting so we don't immediately switch to photo mode on close
-    }
     if(ns_data_ready||wx_data_ready||gmi_ready){
         ns_data_ready=false;wx_data_ready=false;gmi_ready=false;
         if(!inSettings&&bsp_display_lock(200)){
-            if(currentMode==MODE_DASHBOARD)updateDashboardUI();else updatePhotoAlert();
+            updateDashboardUI();
             bsp_display_unlock();
         }
     }
-    if(currentMode==MODE_DASHBOARD&&!inSettings){
+    if(!inSettings){
         static unsigned long lC=0;
         if(now-lC>=1000){lC=now;
             struct tm ti;

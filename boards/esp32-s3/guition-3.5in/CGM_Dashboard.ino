@@ -1199,6 +1199,21 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
     html += (R"HTML("></div>
 <div class="row"><label>Wi-Fi password<small>blank = keep current</small></label>
 <input type="password" name="wifiPass" placeholder="(unchanged)" style="width:140px"></div></div>
+<div class="card"><h2>Home Assistant (MQTT)</h2>
+<div class="row"><label>Broker host<small>HA's MQTT broker IP &#8212; blank = disabled</small></label>
+<input type="text" name="mqttHost" style="width:170px;text-align:left" value=")HTML");
+    html += (mqttHostEff());
+    html += (R"HTML("></div>
+<div class="row"><label>Port<small>usually 1883</small></label>
+<input type="number" name="mqttPort" min="1" max="65535" value=")HTML");
+    html += (String(cfg.mqttPort));
+    html += (R"HTML("></div>
+<div class="row"><label>Username<small>MQTT user (blank = none)</small></label>
+<input type="text" name="mqttUser" style="width:140px;text-align:left" value=")HTML");
+    html += (mqttUserEff());
+    html += (R"HTML("></div>
+<div class="row"><label>Password<small>blank = keep current</small></label>
+<input type="password" name="mqttPass" placeholder="(unchanged)" style="width:140px"></div></div>
 <div class="card"><h2>Weather Location</h2>
 <div class="row"><label>City label<small>Shows on dashboard header</small></label>
 <input type="text" name="city" maxlength="30" style="width:140px;text-align:left" value=")HTML");

@@ -19,6 +19,7 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <DNSServer.h>      // SoftAP captive-portal DNS (WiFi provisioning)
 #include <PubSubClient.h>   // Home Assistant MQTT (auto-discovery)
 #include <HTTPUpdate.h>     // internet OTA (pull updates over HTTPS)
 #include "secrets.h"   // gitignored: WiFi + Nightscout + OTA credentials
@@ -57,10 +58,11 @@ struct DashConfig {
     String nsUrl, nsSecret;              // Nightscout (blank -> secrets.h fallback)
     String mqttHost, mqttUser, mqttPass; // Home Assistant MQTT broker (blank host -> off)
     int    mqttPort;                     // default 1883
+    String wifiSsid, wifiPass;           // WiFi STA creds (blank -> secrets.h fallback)
 };
 DashConfig cfg = {100,20,1,7,10000,70,280, 0,
                   "40.7128","-74.0060","New York",false,"EST5EDT,M3.2.0,M11.1.0",
-                  "","","us", "","","us", "","", "","","",1883};
+                  "","","us", "","","us", "","", "","","",1883, "",""};
 
 void loadConfig() {
     prefs.begin("cfg", true);
@@ -89,6 +91,8 @@ void loadConfig() {
     cfg.mqttPort    = prefs.getInt("mqttPort", 1883);
     cfg.mqttUser    = prefs.getString("mqttUser", "");
     cfg.mqttPass    = prefs.getString("mqttPass", "");
+    cfg.wifiSsid    = prefs.getString("wifiSsid", "");
+    cfg.wifiPass    = prefs.getString("wifiPass", "");
     prefs.end();
 }
 void saveConfig() {
@@ -118,6 +122,8 @@ void saveConfig() {
     prefs.putInt   ("mqttPort", cfg.mqttPort);
     prefs.putString("mqttUser", cfg.mqttUser);
     prefs.putString("mqttPass", cfg.mqttPass);
+    prefs.putString("wifiSsid", cfg.wifiSsid);
+    prefs.putString("wifiPass", cfg.wifiPass);
     prefs.end();
     Serial.println("[Config] Saved");
 }
@@ -127,6 +133,12 @@ void applyTimezone(){
 }
 
 WebServer configServer(80);
+
+// --- WiFi provisioning (SoftAP captive portal) state ---
+DNSServer dnsServer;
+bool   g_provisioning = false;   // true only while in SoftAP setup mode
+String g_apName       = "";      // "glucoscout-<mac4>"
+String g_wifiScanOpts = "";      // cached <datalist> <option> list
 
 static lv_obj_t *lbl_glucose, *lbl_trend, *lbl_time, *lbl_date;
 static lv_obj_t *lbl_weather, *lbl_wifi,  *lbl_status, *lbl_gmi=nullptr;
@@ -148,6 +160,8 @@ static bool      inSettings     = false;
 // Forward declarations
 void enterDashboard();
 void fetchWeather();
+void startProvisioning();
+void handleWifiSetupPage();
 
 static SemaphoreHandle_t dataMutex;
 static int    glucose_val=0, glucose_delta=0;
@@ -206,9 +220,24 @@ void runSafeMode() {
 // ================================================================
 // Network helpers
 // ================================================================
+// Effective WiFi STA creds: web/NVS config overrides, else secrets.h fallback
+String wifiSsidEff(){
+#ifdef WIFI_SSID
+    return cfg.wifiSsid.length()?cfg.wifiSsid:String(WIFI_SSID);
+#else
+    return cfg.wifiSsid;
+#endif
+}
+String wifiPassEff(){
+#ifdef WIFI_PASS
+    return cfg.wifiPass.length()?cfg.wifiPass:String(WIFI_PASS);
+#else
+    return cfg.wifiPass;
+#endif
+}
 void checkWiFi() {
     if(WiFi.status()!=WL_CONNECTED){
-        WiFi.disconnect();WiFi.begin(WIFI_SSID,WIFI_PASS);
+        WiFi.disconnect();WiFi.begin(wifiSsidEff().c_str(),wifiPassEff().c_str());
         for(int i=0;i<20&&WiFi.status()!=WL_CONNECTED;i++) delay(500);
     }
 }
@@ -1163,6 +1192,13 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
     configServer.sendContent(cfg.libRegion);
     configServer.sendContent(R"HTML("></div>
 </div></div>
+<div class="card"><h2>Wi-Fi Network</h2>
+<div class="row"><label>Wi-Fi network<small>SSID the panel connects to</small></label>
+<input type="text" name="wifiSsid" style="width:170px;text-align:left" value=")HTML");
+    configServer.sendContent(wifiSsidEff());
+    configServer.sendContent(R"HTML("></div>
+<div class="row"><label>Wi-Fi password<small>blank = keep current</small></label>
+<input type="password" name="wifiPass" placeholder="(unchanged)" style="width:140px"></div></div>
 <div class="card"><h2>Weather Location</h2>
 <div class="row"><label>City label<small>Shows on dashboard header</small></label>
 <input type="text" name="city" maxlength="30" style="width:140px;text-align:left" value=")HTML");
@@ -1256,7 +1292,7 @@ function lookupCity(){
 // ================================================================
 // Web Server handlers
 // ================================================================
-void handleRoot() { streamConfigPage(); }
+void handleRoot() { if(g_provisioning) handleWifiSetupPage(); else streamConfigPage(); }
 
 void handleSave(){
     bool changed=false;
@@ -1310,12 +1346,141 @@ void handleSave(){
     if(configServer.hasArg("mqttUser")){String v=configServer.arg("mqttUser");if(v.length()<=64&&v!=cfg.mqttUser){cfg.mqttUser=v;changed=true;mqttChanged=true;}}
     if(configServer.hasArg("mqttPass")){String v=configServer.arg("mqttPass");if(v.length()>0&&v.length()<=64){cfg.mqttPass=v;changed=true;mqttChanged=true;}}
     if(mqttChanged)mqttReconfig=true;   // fetchTask (Core 0) reconnects
+    // --- WiFi STA creds (saved now; applied on next reconnect/reboot; blank pass = keep) ---
+    if(configServer.hasArg("wifiSsid")){String v=configServer.arg("wifiSsid");if(v.length()<=64&&v!=cfg.wifiSsid){cfg.wifiSsid=v;changed=true;}}
+    if(configServer.hasArg("wifiPass")){String v=configServer.arg("wifiPass");if(v.length()>0&&v.length()<=64){cfg.wifiPass=v;changed=true;}}
     if(changed){saveConfig();applyTimezone();fetchWeather();configServer.send(200,"text/plain","OK");}
     else configServer.send(400,"text/plain","No valid parameters");
 }
 
 void handleRestart(){configServer.send(200,"text/plain","Restarting...");delay(500);ESP.restart();}
 void handleNotFound(){configServer.send(404,"text/plain","Not found");}
+
+// ================================================================
+// WiFi provisioning — SoftAP captive portal (first-run / bad creds)
+// Lets a buyer set WiFi WITHOUT building from source. Entered from setup()
+// when there are no usable creds or the STA join fails; never returns.
+// ================================================================
+void wifiScanBuild(){            // cache scanned SSIDs as <datalist> options
+    int n=WiFi.scanNetworks();
+    g_wifiScanOpts="";
+    for(int i=0;i<n&&i<24;i++){
+        String s=WiFi.SSID(i);
+        if(s.length()==0)continue;                         // skip hidden
+        s.replace("&","&amp;");s.replace("\"","&quot;");s.replace("<","&lt;");
+        g_wifiScanOpts+="<option value=\""+s+"\">";
+    }
+    WiFi.scanDelete();
+}
+void handleWifiSetupPage(){      // captive-portal setup form (small -> single send)
+    String p=R"HTML(<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wi-Fi Setup</title><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f5;color:#222;padding:18px}
+h1{font-size:1.35rem;color:#e74c3c;margin-bottom:4px}
+.sub{font-size:.82rem;color:#666;margin-bottom:16px}
+.card{background:#fff;border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.1);padding:16px}
+label{display:block;font-size:.9rem;margin:12px 0 4px;font-weight:600}
+input{width:100%;padding:11px;border:1px solid #ddd;border-radius:8px;font-size:1rem;background:#fafafa}
+button{width:100%;border:none;border-radius:10px;padding:14px;margin-top:18px;font-size:1rem;font-weight:700;background:#e74c3c;color:#fff}
+.tip{font-size:.75rem;color:#888;margin-top:10px;text-align:center}
+</style></head><body>
+<h1>&#128246; Wi-Fi Setup</h1>
+<p class="sub">Connect this glucose panel to your home Wi-Fi.</p>
+<div class="card"><form method="POST" action="/wifisave">
+<label>Network name (SSID)</label>
+<input list="nets" name="ssid" placeholder="Pick or type your Wi-Fi" autocomplete="off" required>
+<datalist id="nets">)HTML";
+    p+=g_wifiScanOpts;
+    p+=R"HTML(</datalist>
+<label>Password</label>
+<input type="password" name="pass" placeholder="Leave blank if open network">
+<button type="submit">Save &amp; Connect</button>
+<p class="tip">The panel reboots and joins your network. If it can't, this page reappears.</p>
+</form></div></body></html>)HTML";
+    configServer.send(200,"text/html",p);
+}
+void handleCaptiveRedirect(){    // bounce OS captive-checks to the portal root
+    configServer.sendHeader("Location","http://"+WiFi.softAPIP().toString()+"/",true);
+    configServer.send(302,"text/plain","");
+}
+void handleWifiSave(){
+    String s=configServer.arg("ssid");
+    String pw=configServer.arg("pass");
+    if(s.length()==0||s.length()>64){configServer.send(400,"text/plain","Missing SSID");return;}
+    cfg.wifiSsid=s; cfg.wifiPass=pw;                        // pw may be blank (open network)
+    saveConfig();
+    String body="<!DOCTYPE html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                "<body style='font-family:sans-serif;padding:28px;text-align:center'>"
+                "<h2>Saved &mdash; rebooting&hellip;</h2><p>Joining <b>"+s+"</b>.</p></body>";
+    configServer.send(200,"text/html",body);
+    delay(800);
+    ESP.restart();
+}
+void showProvisioningScreen(){   // on-panel instructions (LVGL)
+    bsp_display_lock(100);
+    lv_obj_clean(lv_scr_act());
+    lv_obj_t *scr=lv_scr_act();
+    lv_obj_set_style_bg_color(scr,lv_color_hex(0x060A14),0);
+    lv_obj_set_style_bg_opa(scr,LV_OPA_COVER,0);
+    lv_obj_t *t=lv_label_create(scr);
+    lv_label_set_text(t,"Wi-Fi Setup");
+    lv_obj_set_style_text_color(t,lv_color_hex(0x00C8FF),0);
+    lv_obj_set_style_text_font(t,&lv_font_montserrat_28,0);
+    lv_obj_align(t,LV_ALIGN_TOP_MID,0,34);
+    lv_obj_t *m=lv_label_create(scr);
+    lv_label_set_text(m,"On your phone or laptop, open\nWi-Fi settings and join:");
+    lv_obj_set_style_text_color(m,lv_color_hex(0xC8D6E5),0);
+    lv_obj_set_style_text_font(m,&lv_font_montserrat_16,0);
+    lv_obj_set_style_text_align(m,LV_TEXT_ALIGN_CENTER,0);
+    lv_obj_align(m,LV_ALIGN_TOP_MID,0,86);
+    lv_obj_t *ap=lv_label_create(scr);
+    lv_label_set_text(ap,g_apName.c_str());
+    lv_obj_set_style_text_color(ap,lv_color_hex(0x00FF88),0);
+    lv_obj_set_style_text_font(ap,&lv_font_montserrat_22,0);
+    lv_obj_align(ap,LV_ALIGN_CENTER,0,6);
+    lv_obj_t *u=lv_label_create(scr);
+    String _apurl="Then open:  http://"+WiFi.softAPIP().toString(); lv_label_set_text(u,_apurl.c_str());
+    lv_obj_set_style_text_color(u,lv_color_hex(0xFFDD00),0);
+    lv_obj_set_style_text_font(u,&lv_font_montserrat_18,0);
+    lv_obj_align(u,LV_ALIGN_CENTER,0,48);
+    lv_obj_t *h=lv_label_create(scr);
+    lv_label_set_text(h,"The setup page usually opens by itself.");
+    lv_obj_set_style_text_color(h,lv_color_hex(0x8899AA),0);
+    lv_obj_set_style_text_font(h,&lv_font_montserrat_12,0);
+    lv_obj_align(h,LV_ALIGN_BOTTOM_MID,0,-22);
+    bsp_display_unlock();
+}
+void startProvisioning(){        // never returns
+    g_provisioning=true;
+    prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.end();   // provisioning isn't a crash loop
+    String mac=WiFi.macAddress(); mac.replace(":","");
+    g_apName="glucoscout-"+mac.substring(8); g_apName.toLowerCase();
+    wifiScanBuild();                          // scan before switching to AP
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(g_apName.c_str());            // open AP (no password)
+    delay(300);
+    IPAddress apIP=WiFi.softAPIP();
+    dnsServer.start(53,"*",apIP);             // captive DNS: every name -> us
+    configServer.on("/",                    HTTP_GET,  handleRoot);          // g_provisioning -> setup page
+    configServer.on("/wifisave",            HTTP_POST, handleWifiSave);
+    configServer.on("/generate_204",                   handleCaptiveRedirect); // Android
+    configServer.on("/gen_204",                        handleCaptiveRedirect); // Android
+    configServer.on("/hotspot-detect.html",            handleCaptiveRedirect); // iOS / macOS
+    configServer.on("/connecttest.txt",                handleCaptiveRedirect); // Windows
+    configServer.on("/ncsi.txt",                       handleCaptiveRedirect); // Windows
+    configServer.onNotFound(handleCaptiveRedirect);
+    configServer.begin();
+    showProvisioningScreen();
+    Serial.printf("[Provisioning] AP '%s' -> http://%s/\n",g_apName.c_str(),apIP.toString().c_str());
+    for(;;){
+        dnsServer.processNextRequest();
+        configServer.handleClient();
+        esp_task_wdt_reset();
+        delay(5);
+    }
+}
 
 void startConfigServer(){
     configServer.on("/",         HTTP_GET,  handleRoot);
@@ -1343,11 +1508,16 @@ void setup(){
     lv_obj_set_style_text_color(sp,lv_color_hex(0xFFFFFF),0);
     lv_obj_set_style_text_font(sp,&lv_font_montserrat_20,0);lv_obj_center(sp);
     bsp_display_unlock();
-    WiFi.begin(WIFI_SSID,WIFI_PASS);
-    for(int i=0;i<30&&WiFi.status()!=WL_CONNECTED;i++)delay(500);
+    loadConfig();                                    // need creds BEFORE we connect
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSsidEff().c_str(),wifiPassEff().c_str());
+    for(int i=0;i<40&&WiFi.status()!=WL_CONNECTED;i++)delay(500);   // ~20s
     Serial.println(WiFi.status()==WL_CONNECTED?"WiFi OK":"WiFi FAILED");
     Serial.println("IP: "+WiFi.localIP().toString());
-    loadConfig();
+    // No usable WiFi creds, or couldn't join -> SoftAP captive portal (never returns)
+    if(wifiSsidEff().length()==0 || WiFi.status()!=WL_CONNECTED){
+        startProvisioning();
+    }
     if(cc>=SAFE_MODE_CRASHES){runSafeMode();}
     ArduinoOTA.setHostname("CGM-Dashboard");ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.onStart([](){

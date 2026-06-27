@@ -1088,9 +1088,9 @@ void applyBrightness(int h){
 // Streamed in chunks (chunked transfer) so the whole ~7KB page is never held
 // in internal RAM at once — only the largest single static chunk is transient.
 void streamConfigPage(){
-    configServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    configServer.send(200,"text/html","");
-    configServer.sendContent(R"HTML(<!DOCTYPE html>
+    String html; html.reserve(7000);
+    /* page buffered, sent at end */
+    html += (R"HTML(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CGM Config</title>
@@ -1127,97 +1127,97 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
 <div class="card"><h2>Brightness</h2>
 <div class="row"><label>Day brightness<small>Normal hours</small></label>
 <input type="number" name="dayBright" min="10" max="100" value=")HTML");
-    configServer.sendContent(String(cfg.dayBright));
-    configServer.sendContent(R"HTML("><span class="unit">%</span></div>
+    html += (String(cfg.dayBright));
+    html += (R"HTML("><span class="unit">%</span></div>
 <div class="row"><label>Night brightness<small>Dim during night mode</small></label>
 <input type="number" name="nightBright" min="5" max="100" value=")HTML");
-    configServer.sendContent(String(cfg.nightBright));
-    configServer.sendContent(R"HTML("><span class="unit">%</span></div></div>
+    html += (String(cfg.nightBright));
+    html += (R"HTML("><span class="unit">%</span></div></div>
 <div class="card"><h2>Night Mode Hours</h2>
 <div class="row"><label>Dim at hour<small>24-hour (1 = 1:00 AM)</small></label>
 <input type="number" name="nightStart" min="0" max="23" value=")HTML");
-    configServer.sendContent(String(cfg.nightStart));
-    configServer.sendContent(R"HTML("><span class="unit">hr</span></div>
+    html += (String(cfg.nightStart));
+    html += (R"HTML("><span class="unit">hr</span></div>
 <div class="row"><label>Brighten at hour<small>24-hour (7 = 7:00 AM)</small></label>
 <input type="number" name="nightEnd" min="0" max="23" value=")HTML");
-    configServer.sendContent(String(cfg.nightEnd));
-    configServer.sendContent(R"HTML("><span class="unit">hr</span></div></div>
+    html += (String(cfg.nightEnd));
+    html += (R"HTML("><span class="unit">hr</span></div></div>
 <div class="card"><h2>Display Timing</h2>
 <div class="row"><label>Dashboard time<small>How long dashboard shows</small></label>
 <input type="number" name="dashboardSec" min="3" max="120" value=")HTML");
-    configServer.sendContent(String(cfg.dashboardMs/1000));
-    configServer.sendContent(R"HTML("><span class="unit">sec</span></div></div>
+    html += (String(cfg.dashboardMs/1000));
+    html += (R"HTML("><span class="unit">sec</span></div></div>
 <div class="card"><h2>Glucose Alert Thresholds</h2>
 <div class="row"><label>Critical LOW<small>Red flash + LOW! overlay</small></label>
 <input type="number" name="critLow" min="40" max="100" value=")HTML");
-    configServer.sendContent(String(cfg.critLow));
-    configServer.sendContent(R"HTML("><span class="unit">mg/dL</span></div>
+    html += (String(cfg.critLow));
+    html += (R"HTML("><span class="unit">mg/dL</span></div>
 <div class="row"><label>Critical HIGH<small>Red flash + HIGH! overlay</small></label>
 <input type="number" name="critHigh" min="150" max="400" value=")HTML");
-    configServer.sendContent(String(cfg.critHigh));
-    configServer.sendContent(R"HTML("><span class="unit">mg/dL</span></div></div>
+    html += (String(cfg.critHigh));
+    html += (R"HTML("><span class="unit">mg/dL</span></div></div>
 <div class="card"><h2>Glucose Source</h2>
 <div class="row"><label>Data source<small>Where glucose readings come from</small></label>
 <select name="cgmSource" id="cgmSource" onchange="srcChange()" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem">
 <option value="0")HTML");
-    if(cfg.cgmSource==0)configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>Nightscout</option>
+    if(cfg.cgmSource==0)html += (" selected");
+    html += (R"HTML(>Nightscout</option>
 <option value="1")HTML");
-    if(cfg.cgmSource==1)configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>Dexcom Share</option>
+    if(cfg.cgmSource==1)html += (" selected");
+    html += (R"HTML(>Dexcom Share</option>
 <option value="2")HTML");
-    if(cfg.cgmSource==2)configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>LibreLinkUp</option>
+    if(cfg.cgmSource==2)html += (" selected");
+    html += (R"HTML(>LibreLinkUp</option>
 </select></div>
 <div id="ns_fields"><div class="row"><label>Nightscout URL</label><input type="text" name="nsurl" style="width:210px;text-align:left" value=")HTML");
-    configServer.sendContent(nsUrl());
-    configServer.sendContent(R"HTML("></div><div class="row"><label>Nightscout secret<small>blank = keep</small></label><input type="password" name="nssecret" placeholder="(unchanged)" style="width:140px"></div></div>
+    html += (nsUrl());
+    html += (R"HTML("></div><div class="row"><label>Nightscout secret<small>blank = keep</small></label><input type="password" name="nssecret" placeholder="(unchanged)" style="width:140px"></div></div>
 <div id="dex_fields" style="display:none">
 <div class="row"><label>Dexcom username</label><input type="text" name="dexUser" style="width:160px;text-align:left" value=")HTML");
-    configServer.sendContent(cfg.dexUser);
-    configServer.sendContent(R"HTML("></div>
+    html += (cfg.dexUser);
+    html += (R"HTML("></div>
 <div class="row"><label>Dexcom password<small>blank = keep current</small></label><input type="password" name="dexPass" placeholder="(unchanged)" style="width:140px"></div>
 <div class="row"><label>Region</label><select name="dexRegion" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px"><option value="us")HTML");
-    if(cfg.dexRegion!="ous")configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>US</option><option value="ous")HTML");
-    if(cfg.dexRegion=="ous")configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>Outside US</option></select></div>
+    if(cfg.dexRegion!="ous")html += (" selected");
+    html += (R"HTML(>US</option><option value="ous")HTML");
+    if(cfg.dexRegion=="ous")html += (" selected");
+    html += (R"HTML(>Outside US</option></select></div>
 </div>
 <div id="lib_fields" style="display:none">
 <div class="row"><label>Libre email</label><input type="text" name="libUser" style="width:160px;text-align:left" value=")HTML");
-    configServer.sendContent(cfg.libUser);
-    configServer.sendContent(R"HTML("></div>
+    html += (cfg.libUser);
+    html += (R"HTML("></div>
 <div class="row"><label>Libre password<small>blank = keep current</small></label><input type="password" name="libPass" placeholder="(unchanged)" style="width:140px"></div>
 <div class="row"><label>Region<small>us / eu / de / fr ...</small></label><input type="text" name="libRegion" maxlength="6" style="width:80px" value=")HTML");
-    configServer.sendContent(cfg.libRegion);
-    configServer.sendContent(R"HTML("></div>
+    html += (cfg.libRegion);
+    html += (R"HTML("></div>
 </div></div>
 <div class="card"><h2>Wi-Fi Network</h2>
 <div class="row"><label>Wi-Fi network<small>SSID the panel connects to</small></label>
 <input type="text" name="wifiSsid" style="width:170px;text-align:left" value=")HTML");
-    configServer.sendContent(wifiSsidEff());
-    configServer.sendContent(R"HTML("></div>
+    html += (wifiSsidEff());
+    html += (R"HTML("></div>
 <div class="row"><label>Wi-Fi password<small>blank = keep current</small></label>
 <input type="password" name="wifiPass" placeholder="(unchanged)" style="width:140px"></div></div>
 <div class="card"><h2>Weather Location</h2>
 <div class="row"><label>City label<small>Shows on dashboard header</small></label>
 <input type="text" name="city" maxlength="30" style="width:140px;text-align:left" value=")HTML");
-    configServer.sendContent(cfg.city);
-    configServer.sendContent(R"HTML("></div>
+    html += (cfg.city);
+    html += (R"HTML("></div>
 <div class="row"><label>Latitude<small>Decimal, e.g. 40.7128</small></label>
 <input type="text" name="lat" maxlength="12" style="width:100px" value=")HTML");
-    configServer.sendContent(cfg.lat);
-    configServer.sendContent(R"HTML("></div>
+    html += (cfg.lat);
+    html += (R"HTML("></div>
 <div class="row"><label>Longitude<small>Decimal, e.g. -74.0060</small></label>
 <input type="text" name="lon" maxlength="12" style="width:100px" value=")HTML");
-    configServer.sendContent(cfg.lon);
-    configServer.sendContent(R"HTML("></div>
+    html += (cfg.lon);
+    html += (R"HTML("></div>
 <div class="row"><label>Temperature unit<small>F or C</small></label>
 <select name="units" style="padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.95rem"><option value="F")HTML");
-    if(!cfg.isCelsius)configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>Fahrenheit</option><option value="C")HTML");
-    if(cfg.isCelsius)configServer.sendContent(" selected");
-    configServer.sendContent(R"HTML(>Celsius</option></select></div>
+    if(!cfg.isCelsius)html += (" selected");
+    html += (R"HTML(>Fahrenheit</option><option value="C")HTML");
+    if(cfg.isCelsius)html += (" selected");
+    html += (R"HTML(>Celsius</option></select></div>
 <div class="row"><label>Lookup by city name<small>Auto-fills lat/lon</small></label>
 <button type="button" class="br" style="padding:7px 14px;font-size:.85rem" onclick="lookupCity()">Find Coords</button></div></div>
 <div class="card"><h2>Time Zone</h2>
@@ -1227,7 +1227,7 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
         String o="<option value=\"";o+=val;o+="\"";
         if(cfg.tzString==val)o+=" selected";
         o+=">";o+=lbl;o+="</option>";
-        configServer.sendContent(o);
+        html += (o);
     };
     tzOpt("EST5EDT,M3.2.0,M11.1.0","US Eastern");
     tzOpt("CST6CDT,M3.2.0,M11.1.0","US Central");
@@ -1248,14 +1248,14 @@ button{border:none;border-radius:10px;padding:13px 20px;font-size:.95rem;font-we
     tzOpt("AEST-10AEDT,M10.1.0,M4.1.0/3","Australia (Sydney)");
     tzOpt("NZST-12NZDT,M9.5.0,M4.1.0/3","New Zealand");
     tzOpt("UTC0","UTC");
-    configServer.sendContent(R"HTML(</select></div></div>
+    html += (R"HTML(</select></div></div>
 <div class="brow">
 <button class="bs" type="button" onclick="doSave()">Save Settings</button>
 <button class="br" type="button" onclick="doRestart()">Restart Board</button>
 </div></form>
 <p class="ip">CGM-Dashboard &#8226; )HTML");
-    configServer.sendContent(WiFi.localIP().toString());
-    configServer.sendContent(R"HTML(</p>
+    html += (WiFi.localIP().toString());
+    html += (R"HTML(</p>
 <script>
 var toast=document.getElementById("toast");
 function showToast(m,e){toast.textContent=m;toast.className="toast"+(e?" err":"");
@@ -1286,7 +1286,7 @@ function lookupCity(){
       showToast("Found: "+hit.name+", "+hit.country+" - hit Save to apply");
     }).catch(function(){showToast("Lookup failed",true);});}
 </script></body></html>)HTML");
-    configServer.sendContent("");   // terminate chunked response
+    configServer.send(200,"text/html",html);   // single buffered send (avoids chunked empty-value truncation)
 }
 
 // ================================================================

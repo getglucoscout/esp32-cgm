@@ -1,0 +1,5 @@
+{
+  "version": "1.0.0-rc1",
+  "url": "https://github.com/glucoscout/esp32-cgm/releases/download/v1.0.0-rc1/CGM_Dashboard-s3.bin",
+  "notes": "MQTT/Home Assistant auto-discovery + internet OTA"
+}

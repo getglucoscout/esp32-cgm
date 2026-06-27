@@ -21,7 +21,10 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <PubSubClient.h>   // Home Assistant MQTT (auto-discovery)
+#include <HTTPUpdate.h>     // internet OTA (pull updates over HTTPS)
 #include "secrets.h"   // gitignored: WiFi + Nightscout + OTA credentials
+#include "version.h"   // FW_VERSION
 
 Preferences prefs;
 
@@ -59,10 +62,12 @@ struct DashConfig {
     String dexUser, dexPass, dexRegion;  // Dexcom Share (region us/ous)
     String libUser, libPass, libRegion;  // LibreLinkUp (region us/eu/de/...)
     String nsUrl, nsSecret;              // Nightscout (blank -> secrets.h fallback)
+    String mqttHost, mqttUser, mqttPass; // Home Assistant MQTT broker (blank host -> off)
+    int    mqttPort;                     // default 1883
 };
 DashConfig cfg = {100,20,1,7,10000,10000,70,280, 0,
                   "40.7128","-74.0060","New York",false,"EST5EDT,M3.2.0,M11.1.0",
-                  "","","us", "","","us", "",""};
+                  "","","us", "","","us", "","", "","","",1883};
 
 void loadConfig() {
     prefs.begin("cfg", true);
@@ -88,6 +93,10 @@ void loadConfig() {
     cfg.libRegion   = prefs.getString("libRegion", "us");
     cfg.nsUrl       = prefs.getString("nsUrl", "");
     cfg.nsSecret    = prefs.getString("nsSecret", "");
+    cfg.mqttHost    = prefs.getString("mqttHost", "");
+    cfg.mqttPort    = prefs.getInt("mqttPort", 1883);
+    cfg.mqttUser    = prefs.getString("mqttUser", "");
+    cfg.mqttPass    = prefs.getString("mqttPass", "");
     prefs.end();
 }
 void saveConfig() {
@@ -114,6 +123,10 @@ void saveConfig() {
     prefs.putString("libRegion",cfg.libRegion);
     prefs.putString("nsUrl",    cfg.nsUrl);
     prefs.putString("nsSecret", cfg.nsSecret);
+    prefs.putString("mqttHost", cfg.mqttHost);
+    prefs.putInt   ("mqttPort", cfg.mqttPort);
+    prefs.putString("mqttUser", cfg.mqttUser);
+    prefs.putString("mqttPass", cfg.mqttPass);
     prefs.end();
     Serial.println("[Config] Saved");
 }
@@ -562,13 +575,147 @@ void fetchGlucose(){
 }
 const char* cgmSourceName(){return cfg.cgmSource==1?"Dexcom":cfg.cgmSource==2?"Libre":"Nightscout";}
 
+// ================================================================
+// Home Assistant via MQTT — auto-discovery (the panel is HA's glucose source).
+// All MQTT/OTA calls run on the Core-0 fetch task; the web handler only flips a
+// flag (PubSubClient / httpUpdate are not thread-safe). blank host = standalone.
+// ================================================================
+static WiFiClient    mqttNet;
+static PubSubClient  mqtt(mqttNet);
+static bool          mqttDiscoverySent=false;
+static volatile bool mqttReconfig=false;
+static unsigned long mqttLastTry=0;
+
+String mqttNodeId(){ String m=WiFi.macAddress(); m.replace(":",""); m.toLowerCase(); return "glucoscout_"+m; }
+String mqttHostEff(){
+#ifdef MQTT_HOST
+    return cfg.mqttHost.length()?cfg.mqttHost:String(MQTT_HOST);
+#else
+    return cfg.mqttHost;
+#endif
+}
+String mqttUserEff(){
+#ifdef MQTT_USER
+    return cfg.mqttUser.length()?cfg.mqttUser:String(MQTT_USER);
+#else
+    return cfg.mqttUser;
+#endif
+}
+String mqttPassEff(){
+#ifdef MQTT_PASS
+    return cfg.mqttPass.length()?cfg.mqttPass:String(MQTT_PASS);
+#else
+    return cfg.mqttPass;
+#endif
+}
+
+void mqttPublishDiscovery(){
+    String node=mqttNodeId();
+    String stateT="glucoscout/"+node+"/state";
+    String availT="glucoscout/"+node+"/status";
+    String dev="{\"identifiers\":[\""+node+"\"],\"name\":\"glucoscout panel\",\"mf\":\"glucoscout\",\"mdl\":\"CGM panel\"}";
+    auto sensor=[&](const char*key,const char*name,const char*unit,const char*tmpl,const char*icon){
+        String t="homeassistant/sensor/"+node+"/"+key+"/config";
+        String p="{\"name\":\""+String(name)+"\",\"uniq_id\":\""+node+"_"+key+"\",";
+        p+="\"stat_t\":\""+stateT+"\",\"avty_t\":\""+availT+"\",";
+        p+="\"val_tpl\":\""+String(tmpl)+"\",";
+        if(unit[0])p+="\"unit_of_meas\":\""+String(unit)+"\",";
+        if(icon[0])p+="\"ic\":\""+String(icon)+"\",";
+        p+="\"dev\":"+dev+"}";
+        mqtt.publish(t.c_str(),p.c_str(),true);   // retained
+    };
+    sensor("glucose","Glucose","mg/dL","{{ value_json.glucose }}","mdi:diabetes");
+    sensor("trend","Glucose Trend","","{{ value_json.trend }}","mdi:trending-up");
+    sensor("delta","Glucose Delta","mg/dL","{{ value_json.delta }}","mdi:delta");
+    sensor("gmi","GMI (est-A1C)","%","{{ value_json.gmi }}","mdi:water-percent");
+    mqttDiscoverySent=true;
+    Serial.println("[MQTT] HA discovery published");
+}
+
+void mqttPublishState(){
+    if(!mqtt.connected())return;
+    int gv,gd; String ta; float g30;
+    xSemaphoreTake(dataMutex,portMAX_DELAY);
+    gv=glucose_val; gd=glucose_delta; ta=trend_arrow; g30=gmi30;
+    xSemaphoreGive(dataMutex);
+    char buf[160];
+    snprintf(buf,sizeof(buf),"{\"glucose\":%d,\"trend\":\"%s\",\"delta\":%d,\"gmi\":%.2f}",gv,ta.c_str(),gd,g30);
+    String t="glucoscout/"+mqttNodeId()+"/state";
+    mqtt.publish(t.c_str(),buf,true);   // retained
+}
+
+void mqttEnsure(){            // every ~1s from fetchTask (Core 0): keepalive + reconnect
+    static bool inited=false;
+    if(mqttReconfig){mqttReconfig=false;if(mqtt.connected())mqtt.disconnect();mqttDiscoverySent=false;}
+    if(mqttHostEff().length()==0)return;                    // standalone
+    if(mqtt.connected()){mqtt.loop();return;}
+    unsigned long now=millis();
+    if(inited && (int32_t)(now-mqttLastTry)<5000)return;    // throttle reconnect
+    mqttLastTry=now;
+    if(!inited){mqtt.setBufferSize(1024);inited=true;}      // HA discovery configs are big
+    int port=cfg.mqttPort>0?cfg.mqttPort:1883;
+    mqtt.setServer(mqttHostEff().c_str(),port);
+    String node=mqttNodeId(), availT="glucoscout/"+node+"/status";
+    String u=mqttUserEff(),pw=mqttPassEff();
+    bool ok=mqtt.connect(node.c_str(), u.length()?u.c_str():nullptr, pw.length()?pw.c_str():nullptr,
+                         availT.c_str(),0,true,"offline");
+    if(ok){
+        Serial.printf("[MQTT] connected -> %s:%d\n",mqttHostEff().c_str(),port);
+        mqtt.publish(availT.c_str(),"online",true);
+        mqttPublishDiscovery();
+        mqttPublishState();
+    } else Serial.printf("[MQTT] connect failed rc=%d\n",mqtt.state());
+}
+
+// ---- internet OTA: pull updates over HTTPS from the GitHub per-board manifest ----
+#ifndef OTA_MANIFEST_URL
+#define OTA_MANIFEST_URL "https://raw.githubusercontent.com/glucoscout/esp32-cgm/main/boards/esp32-s3/guition-3.5in/manifest.json"
+#endif
+#define OTA_CHECK_MS (24UL*60UL*60000UL)   // auto-check daily
+static volatile bool otaRequested=false;
+static String otaStatus="idle";
+
+String otaFetchManifest(String& binUrl){
+    WiFiClientSecure c; c.setInsecure();
+    HTTPClient h; h.setConnectTimeout(8000); h.setTimeout(8000);
+    if(!h.begin(c, OTA_MANIFEST_URL)) return "";
+    String ver="";
+    if(h.GET()==200){
+        JsonDocument d(&g_psram);
+        if(deserializeJson(d,h.getStream())==DeserializationError::Ok){
+            ver=String((const char*)(d["version"]|""));
+            binUrl=String((const char*)(d["url"]|""));
+        }
+    }
+    h.end(); return ver;
+}
+void otaRunUpdate(){          // Core 0 (fetchTask) ONLY — blocking; reboots on success
+    String binUrl, latest=otaFetchManifest(binUrl);
+    if(latest.length()==0){otaStatus="check failed"; Serial.println("[OTA] manifest fetch failed"); return;}
+    if(latest==String(FW_VERSION)){otaStatus="up to date ("+latest+")"; Serial.printf("[OTA] up to date %s\n",latest.c_str()); return;}
+    if(binUrl.length()==0){otaStatus="newer version, no url"; return;}
+    otaStatus="updating "+String(FW_VERSION)+" -> "+latest;
+    Serial.printf("[OTA] %s -> %s : %s\n",FW_VERSION,latest.c_str(),binUrl.c_str());
+    WiFiClientSecure uc; uc.setInsecure();
+    httpUpdate.rebootOnUpdate(true);
+    t_httpUpdate_return r=httpUpdate.update(uc, binUrl);
+    if(r==HTTP_UPDATE_FAILED) otaStatus="failed: "+httpUpdate.getLastErrorString();
+    else if(r==HTTP_UPDATE_NO_UPDATES) otaStatus="no update";
+    // HTTP_UPDATE_OK reboots automatically
+}
+void handleOtaCheck(){ otaRequested=true; configServer.send(200,"text/plain","Checking for updates..."); }
+void handleOtaStatus(){ configServer.send(200,"text/plain", String(FW_VERSION)+" | "+otaStatus); }
+
 void fetchTask(void*p){
     while(WiFi.status()!=WL_CONNECTED)vTaskDelay(pdMS_TO_TICKS(500));
-    unsigned long nNS=0,nWX=0,nGMI=0,taskStart=millis();bool gmiInit=false;
+    unsigned long nNS=0,nWX=0,nGMI=0,nOTA=0,taskStart=millis();bool gmiInit=false;
     Serial.printf("[CGM] source=%s\n",cgmSourceName());
     for(;;){
         unsigned long now=millis();checkWiFi();
-        if(now-nNS>=NS_UPDATE_MS){nNS=now;fetchGlucose();}
+        mqttEnsure();
+        if(otaRequested){otaRequested=false;otaRunUpdate();}
+        if(now-nNS>=NS_UPDATE_MS){nNS=now;fetchGlucose();mqttPublishState();}
+        if(now-nOTA>=OTA_CHECK_MS){nOTA=now;otaRunUpdate();}
         if(now-nWX>=WEATHER_UPDATE_MS){nWX=now;fetchWeather();}
         // GMI (est-A1C) only for Nightscout: first ~15s after boot, then hourly
         if(cfg.cgmSource==0){
@@ -1491,6 +1638,13 @@ void handleSave(){
     if(configServer.hasArg("libPass")){String v=configServer.arg("libPass");if(v.length()>0&&v.length()<=80){cfg.libPass=v;changed=true;srcChanged=true;}}
     if(configServer.hasArg("nssecret")){String v=configServer.arg("nssecret");if(v.length()>0&&v.length()<=96){cfg.nsSecret=v;changed=true;srcChanged=true;}}
     if(srcChanged){s_dexSession="";s_libToken="";s_libAcct="";s_libPatient="";}  // force re-login
+    // --- Home Assistant MQTT broker (blank host = disabled) ---
+    bool mqttChanged=false;
+    if(configServer.hasArg("mqttHost")){String v=configServer.arg("mqttHost");if(v.length()<=80&&v!=cfg.mqttHost){cfg.mqttHost=v;changed=true;mqttChanged=true;}}
+    if(configServer.hasArg("mqttPort")){int v=configServer.arg("mqttPort").toInt();if(v>=1&&v<=65535&&v!=cfg.mqttPort){cfg.mqttPort=v;changed=true;mqttChanged=true;}}
+    if(configServer.hasArg("mqttUser")){String v=configServer.arg("mqttUser");if(v.length()<=64&&v!=cfg.mqttUser){cfg.mqttUser=v;changed=true;mqttChanged=true;}}
+    if(configServer.hasArg("mqttPass")){String v=configServer.arg("mqttPass");if(v.length()>0&&v.length()<=64){cfg.mqttPass=v;changed=true;mqttChanged=true;}}
+    if(mqttChanged)mqttReconfig=true;   // fetchTask (Core 0) reconnects
     if(changed){saveConfig();applyTimezone();fetchWeather();configServer.send(200,"text/plain","OK");}
     else configServer.send(400,"text/plain","No valid parameters");
 }
@@ -1529,6 +1683,8 @@ void handleNotFound(){configServer.send(404,"text/plain","Not found");}
 void startConfigServer(){
     configServer.on("/",         HTTP_GET,  handleRoot);
     configServer.on("/save",     HTTP_POST, handleSave);
+    configServer.on("/otacheck", HTTP_POST, handleOtaCheck);
+    configServer.on("/otastatus",HTTP_GET,  handleOtaStatus);
     configServer.on("/restart",  HTTP_POST, handleRestart);
     configServer.on("/togglemode", HTTP_POST, handleToggleMode);
     configServer.on("/files",    HTTP_GET,  handleFilesPage);

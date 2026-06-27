@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-rc1] - 2026-06-27
+
+First **release candidate**. Adds Home Assistant integration, internet
+(over-the-air) updates, and buyer-friendly Wi-Fi setup.
+
+### Added
+- **Home Assistant over MQTT** with auto-discovery (glucose, trend, delta,
+  estimated A1C), plus a 4th "HA control" page that publishes announce / light /
+  snooze / two spare commands for your own automations to act on.
+- **Internet OTA updates** — the panel checks a per-board `manifest.json` daily
+  (and on demand) and updates itself from the GitHub release; no USB required.
+- **Wi-Fi provisioning (captive portal)** so a panel can be set up without
+  flashing: it opens a `glucoscout-XXXX` access point on first boot.
+- **4-page swipe UI** — dashboard, big-glucose, device info, and HA control;
+  long-press still opens Settings.
+- On-screen IP address, a factory-reset button, and a `/dbg` diagnostics endpoint.
+- A "Home Assistant (MQTT)" card in the web config.
+
+### Changed
+- Slimmer firmware: the SD photo-frame was removed and the config page is sent
+  more efficiently (about 10% of flash, 17% of RAM).
+
+### Fixed
+- Weather sometimes showed blank — open-meteo replies with chunked
+  transfer-encoding, which the streaming parser couldn't read; the body is now
+  read fully before parsing.
+- MQTT never connected (state -2): the broker hostname is now kept in a
+  persistent buffer (the client library stored the pointer, not a copy).
+- The config page could truncate when some fields were empty.
+
+### Notes
+- **Release candidate** (`1.0.0-rc1`). Not a medical device — see
+  [DISCLAIMER.md](DISCLAIMER.md).
+
 ## [1.0.0-beta.2] - 2026-06-25
 
 ### Fixed
@@ -39,6 +73,7 @@ First public **beta** release.
   device — see [DISCLAIMER.md](DISCLAIMER.md).
 - ESP32-P4 (GUITION 10.1") support is in progress and not part of this release.
 
-[Unreleased]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-beta.2...HEAD
+[Unreleased]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-rc1...HEAD
+[1.0.0-rc1]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-beta.2...v1.0.0-rc1
 [1.0.0-beta.2]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/glucoscout/esp32-cgm/releases/tag/v1.0.0-beta.1

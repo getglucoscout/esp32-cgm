@@ -1477,8 +1477,7 @@ void startProvisioning(){        // never returns
     for(;;){
         dnsServer.processNextRequest();
         configServer.handleClient();
-        esp_task_wdt_reset();
-        delay(5);
+        delay(5);   // no esp_task_wdt_reset: this task isn't WDT-subscribed during setup()
     }
 }
 

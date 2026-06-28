@@ -22,6 +22,7 @@
 #include <DNSServer.h>      // SoftAP captive-portal DNS (WiFi provisioning)
 #include <PubSubClient.h>   // Home Assistant MQTT (auto-discovery)
 #include <HTTPUpdate.h>     // internet OTA (pull updates over HTTPS)
+#include <esp_ota_ops.h>   // OTA partitions — auto-rollback to the last-good slot on a bad update
 #include "secrets.h"   // gitignored: WiFi + Nightscout + OTA credentials
 #include "version.h"   // FW_VERSION
 
@@ -187,6 +188,31 @@ struct FcDay { char dow[4]; int code, hi, lo; bool valid; };
 static FcDay forecast[4] = {};          // next 4 days (shared, dataMutex)
 
 // ================================================================
+// OTA recovery ladder — auto-rollback to the previous firmware
+// ================================================================
+// A bad update that boot-loops bumps the crash counter (setup); before we fall to safe mode we
+// revert to the OTHER OTA slot — the last-good firmware — so a buyer never needs a USB cable.
+// Guards: only boot a slot that holds a VALID app image, and the `rolledback` NVS flag stops a
+// ping-pong if BOTH slots are bad (then we go to internet-OTA safe mode instead). Only ever
+// runs from the already-crash-looping path, so it cannot harm a healthy unit.
+static bool tryOtaRollback(){
+    prefs.begin("boot",false);
+    bool already=prefs.getBool("rolledback",false);
+    prefs.end();
+    if(already) return false;                                              // reverted once already
+    const esp_partition_t* other=esp_ota_get_next_update_partition(NULL);  // the non-running OTA slot
+    esp_app_desc_t desc;
+    if(!other || esp_ota_get_partition_description(other,&desc)!=ESP_OK) return false;  // no valid app there
+    if(esp_ota_set_boot_partition(other)!=ESP_OK) return false;
+    prefs.begin("boot",false);
+    prefs.putBool("rolledback",true);
+    prefs.putInt("crashes",0);                                            // clean slate for the reverted firmware
+    prefs.end();
+    Serial.printf("[recovery] rolling back to %s (%s)\n", other->label, desc.version);
+    return true;
+}
+
+// ================================================================
 // Safe mode
 // ================================================================
 void runSafeMode() {
@@ -201,7 +227,7 @@ void runSafeMode() {
     lv_obj_set_style_text_font(t,&lv_font_montserrat_28,0);
     lv_obj_align(t,LV_ALIGN_TOP_MID,0,30);
     lv_obj_t *m=lv_label_create(scr);
-    lv_label_set_text(m,"Crashed 3 times.\nPush fixed code\nover WiFi OTA.");
+    lv_label_set_text(m,"Recovering...\nAuto-checking for a\nfixed update over WiFi.");
     lv_obj_set_style_text_color(m,lv_color_hex(0xFFFFFF),0);
     lv_obj_set_style_text_font(m,&lv_font_montserrat_16,0);
     lv_obj_set_style_text_align(m,LV_TEXT_ALIGN_CENTER,0);
@@ -228,7 +254,15 @@ void runSafeMode() {
         prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.end();
     });
     ArduinoOTA.begin();
-    for(;;){ArduinoOTA.handle();delay(10);}
+    // Internet OTA: poll the manifest every 60s and pull a *published fix* (a bumped version),
+    // alongside the local ArduinoOTA push. The operator just cuts a fixed release and stuck
+    // units recover themselves — no USB, no house call.
+    unsigned long lastOta=0;
+    for(;;){
+        ArduinoOTA.handle();
+        if(millis()-lastOta>60000UL){ lastOta=millis(); otaRunUpdate(); }  // reboots on a successful pull
+        delay(10);
+    }
 }
 
 // ================================================================
@@ -1833,7 +1867,10 @@ void setup(){
     if(wifiSsidEff().length()==0 || WiFi.status()!=WL_CONNECTED){
         startProvisioning();
     }
-    if(cc>=SAFE_MODE_CRASHES){runSafeMode();}
+    if(cc>=SAFE_MODE_CRASHES){
+        if(tryOtaRollback()){ delay(200); ESP.restart(); }   // revert to the last-good firmware, or...
+        runSafeMode();                                       // ...internet-OTA safe mode (never returns)
+    }
     ArduinoOTA.setHostname("CGM-Dashboard");ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.onStart([](){
         esp_task_wdt_delete(NULL);bsp_display_lock(100);lv_obj_clean(lv_scr_act());
@@ -1854,7 +1891,8 @@ void setup(){
     fetchGlucose();fetchWeather();
     bsp_display_lock(100);updateDashboardUI();bsp_display_unlock();
     xTaskCreatePinnedToCore(fetchTask,"fetchTask",16384,NULL,1,NULL,0);
-    prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.end();
+    prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.putBool("rolledback",false);prefs.end();
+    esp_ota_mark_app_valid_cancel_rollback();   // healthy boot: confirm this image (validates a pending OTA; no-op otherwise)
     Serial.println("Boot OK");
     esp_task_wdt_config_t wc={.timeout_ms=30000,.idle_core_mask=0,.trigger_panic=true};
     esp_task_wdt_init(&wc);esp_task_wdt_add(NULL);

@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **OTA recovery ladder** — a bad over-the-air update can no longer leave a panel
+  needing a USB cable. If new firmware boot-loops, the panel automatically rolls back
+  to the previous firmware in its other app slot; if that isn't possible it shows a
+  "Recovering" screen and auto-pulls a published fix over Wi-Fi (the local OTA push
+  still works too). Each healthy boot is marked valid so a good update sticks.
+
 ## [1.0.0-rc1] - 2026-06-27
 
 First **release candidate**. Adds Home Assistant integration, internet

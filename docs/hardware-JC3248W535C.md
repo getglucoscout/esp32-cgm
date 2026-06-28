@@ -108,7 +108,7 @@ Useful sketches inside the ZIP:
 
 ### Features
 - Nightscout glucose readings (every 60 seconds)
-- Open-Meteo weather — New York (every 5 minutes)
+- Open-Meteo weather — your configured location (every 5 minutes)
 - Live clock + date
 - WiFi signal strength
 - Color-coded glucose (green/orange/red)
@@ -119,7 +119,7 @@ Useful sketches inside the ZIP:
 #define WIFI_PASS        "YOUR_WIFI_PASSWORD"
 #define NS_URL           "https://your-nightscout.example.com"
 #define NS_SECRET        "YOUR_NIGHTSCOUT_API_SECRET"
-#define OWM_LAT          "40.7128"   // New York
+#define OWM_LAT          "40.7128"   // example only — set your own
 #define OWM_LON          "-74.0060"
 #define NS_UPDATE_MS     60000UL         // Nightscout every 60s
 #define WEATHER_UPDATE_MS (5 * 60000UL) // Weather every 5 min

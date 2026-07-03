@@ -9,7 +9,7 @@ This project is pre-1.0 (beta). Security fixes target the latest release and
 
 Please report security issues **privately** — do not open a public issue.
 
-- Use GitHub's [private vulnerability reporting](https://github.com/glucoscout/esp32-cgm/security/advisories/new), or
+- Use GitHub's [private vulnerability reporting](https://github.com/getglucoscout/esp32-cgm/security/advisories/new), or
 - email **security@glucoscout.com**.
 
 Include reproduction steps and affected version/commit. We aim to acknowledge

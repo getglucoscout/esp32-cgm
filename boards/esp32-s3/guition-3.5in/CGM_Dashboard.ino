@@ -732,7 +732,7 @@ void mqttEnsure(){            // every ~1s from fetchTask (Core 0): keepalive + 
 
 // ---- internet OTA: pull updates over HTTPS from the GitHub per-board manifest ----
 #ifndef OTA_MANIFEST_URL
-#define OTA_MANIFEST_URL "https://raw.githubusercontent.com/glucoscout/esp32-cgm/main/boards/esp32-s3/guition-3.5in/manifest.json"
+#define OTA_MANIFEST_URL "https://raw.githubusercontent.com/getglucoscout/esp32-cgm/main/boards/esp32-s3/guition-3.5in/manifest.json"
 #endif
 #define OTA_CHECK_MS (24UL*60UL*60000UL)   // auto-check daily
 static volatile bool otaRequested=false;

@@ -1,8 +1,7 @@
 # esp32-cgm
 
-[![Release](https://img.shields.io/github/v/release/glucoscout/esp32-cgm?include_prereleases&sort=semver)](https://github.com/glucoscout/esp32-cgm/releases)
+[![Release](https://img.shields.io/github/v/release/getglucoscout/esp32-cgm?include_prereleases&sort=semver)](https://github.com/getglucoscout/esp32-cgm/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/glucoscout/esp32-cgm/actions/workflows/ci.yml/badge.svg)](https://github.com/glucoscout/esp32-cgm/actions/workflows/ci.yml)
 [![Platform: ESP32](https://img.shields.io/badge/platform-ESP32-blue.svg)](#supported-hardware)
 
 Open-source firmware that turns inexpensive ESP32 touch-display boards into a
@@ -51,7 +50,7 @@ supported board on every change.
 
 This project follows [Semantic Versioning](https://semver.org/). Released
 builds are tagged and published on the
-[Releases page](https://github.com/glucoscout/esp32-cgm/releases); see
+[Releases page](https://github.com/getglucoscout/esp32-cgm/releases); see
 [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Contributing

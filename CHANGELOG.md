@@ -80,7 +80,7 @@ First public **beta** release.
   device — see [DISCLAIMER.md](DISCLAIMER.md).
 - ESP32-P4 (GUITION 10.1") support is in progress and not part of this release.
 
-[Unreleased]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-rc1...HEAD
-[1.0.0-rc1]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-beta.2...v1.0.0-rc1
-[1.0.0-beta.2]: https://github.com/glucoscout/esp32-cgm/compare/v1.0.0-beta.1...v1.0.0-beta.2
-[1.0.0-beta.1]: https://github.com/glucoscout/esp32-cgm/releases/tag/v1.0.0-beta.1
+[Unreleased]: https://github.com/getglucoscout/esp32-cgm/compare/v1.0.0-rc1...HEAD
+[1.0.0-rc1]: https://github.com/getglucoscout/esp32-cgm/compare/v1.0.0-beta.2...v1.0.0-rc1
+[1.0.0-beta.2]: https://github.com/getglucoscout/esp32-cgm/compare/v1.0.0-beta.1...v1.0.0-beta.2
+[1.0.0-beta.1]: https://github.com/getglucoscout/esp32-cgm/releases/tag/v1.0.0-beta.1

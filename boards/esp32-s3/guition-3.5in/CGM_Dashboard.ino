@@ -761,6 +761,11 @@ void otaRunUpdate(){          // Core 0 (fetchTask) ONLY — blocking; reboots o
     Serial.printf("[OTA] %s -> %s : %s\n",FW_VERSION,latest.c_str(),binUrl.c_str());
     WiFiClientSecure uc; uc.setInsecure();
     httpUpdate.rebootOnUpdate(true);
+    // The image we are about to boot must start with a clean crash slate. Without this, a
+    // safe-mode pull reboots into the fix with crashes>=3 still in NVS, so the perfectly
+    // healthy fix lands straight back in safe mode and loops there (found in hardware
+    // testing of the recovery ladder — the panel recovered, then re-trapped itself).
+    prefs.begin("boot",false);prefs.putInt("crashes",0);prefs.end();
     t_httpUpdate_return r=httpUpdate.update(uc, binUrl);
     if(r==HTTP_UPDATE_FAILED) otaStatus="failed: "+httpUpdate.getLastErrorString();
     else if(r==HTTP_UPDATE_NO_UPDATES) otaStatus="no update";

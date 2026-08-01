@@ -6,12 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-rc2] - 2026-07-31
+
 ### Added
 - **OTA recovery ladder** — a bad over-the-air update can no longer leave a panel
   needing a USB cable. If new firmware boot-loops, the panel automatically rolls back
   to the previous firmware in its other app slot; if that isn't possible it shows a
   "Recovering" screen and auto-pulls a published fix over Wi-Fi (the local OTA push
   still works too). Each healthy boot is marked valid so a good update sticks.
+  Proven on hardware before this release: a deliberately crash-looping build was
+  pushed over the air and rolled back on its own, and with *both* app slots
+  deliberately broken the panel recovered itself from safe mode — no USB either time.
+
+### Changed
+- Shipped binaries now bake the project's current home for updates
+  (`getglucoscout/esp32-cgm`); the rc1 binaries pointed at the old repository
+  location and should be reflashed once, after which OTA works normally again.
 
 ## [1.0.0-rc1] - 2026-06-27
 

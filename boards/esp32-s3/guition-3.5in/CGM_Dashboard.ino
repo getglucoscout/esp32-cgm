@@ -1813,7 +1813,14 @@ void showProvisioningScreen(){   // on-panel instructions (LVGL)
     lv_label_set_text(ap,g_apName.c_str());
     lv_obj_set_style_text_color(ap,lv_color_hex(0x00FF88),0);
     lv_obj_set_style_text_font(ap,&lv_font_montserrat_22,0);
-    lv_obj_align(ap,LV_ALIGN_CENTER,0,6);
+    lv_obj_align(ap,LV_ALIGN_CENTER,0,0);
+    // An open network makes people hesitate or hunt for a password that does not
+    // exist. Say so directly, right under the name they are about to tap.
+    lv_obj_t *np=lv_label_create(scr);
+    lv_label_set_text(np,"No password needed");
+    lv_obj_set_style_text_color(np,lv_color_hex(0xC8D6E5),0);
+    lv_obj_set_style_text_font(np,&lv_font_montserrat_14,0);
+    lv_obj_align(np,LV_ALIGN_CENTER,0,26);
     lv_obj_t *u=lv_label_create(scr);
     String _apurl="Then open:  http://"+WiFi.softAPIP().toString(); lv_label_set_text(u,_apurl.c_str());
     lv_obj_set_style_text_color(u,lv_color_hex(0xFFDD00),0);

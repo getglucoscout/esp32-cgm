@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-rc3] - 2026-08-04
+
+### Security
+- **OTA transport is now certificate-pinned.** The update manifest and firmware
+  download previously skipped TLS verification, so anyone in a position to
+  intercept traffic could feed the panel a hostile "update" — remote code
+  execution by design of what OTA is. Both fetches now validate against a small
+  pinned bundle of the roots the update hosts actually chain to (Let's Encrypt,
+  Sectigo/USERTrust, plus one legacy family as rotation insurance), with an SNTP
+  clock sync before the first handshake — an unset clock rejects every
+  certificate, and a failed sync skips the check rather than downgrading to
+  unverified TLS. Glucose fetches to your own configured Nightscout/Dexcom hosts
+  are unchanged.
+
+### Changed
+- The Home Assistant sensor is now labelled **GMI** — the "estimated A1C"
+  wording was retired by the FDA in 2018, and the hosted portal already says
+  plain GMI; the panel now agrees with it.
+
 ## [1.0.0-rc2] - 2026-07-31
 
 ### Added

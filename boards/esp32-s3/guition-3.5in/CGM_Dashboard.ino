@@ -25,6 +25,7 @@
 #include <esp_ota_ops.h>   // OTA partitions — auto-rollback to the last-good slot on a bad update
 #include "secrets.h"   // gitignored: WiFi + Nightscout + OTA credentials
 #include "version.h"   // FW_VERSION
+#include "ota_roots.h" // pinned root CAs for OTA transport (and only OTA)
 
 Preferences prefs;
 
@@ -41,7 +42,7 @@ static PsramAllocator g_psram;
 
 #define NS_UPDATE_MS        60000UL
 #define WEATHER_UPDATE_MS   (5 * 60000UL)
-#define GMI_UPDATE_MS       (60UL * 60000UL)   // est-A1C (GMI) recompute hourly
+#define GMI_UPDATE_MS       (60UL * 60000UL)   // GMI recompute hourly
 #define GMI_COUNT_30D       8640                // ~30 days at 5-min readings
 #define GMI_COUNT_90D       25920               // ~90 days at 5-min readings
 #define DEX_APPID  "d89443d2-327c-4a6f-89e5-496bbb0317db"   // well-known Dexcom Share app id
@@ -182,7 +183,7 @@ static volatile int  g_wxHttp=-1;      // last open-meteo HTTP code (-1 = not ru
 static volatile bool g_wxParse=false;  // last weather JSON parse ok? [diag]
 static String trend_arrow="-", weather_str="--";
 static volatile bool ns_data_ready=false, wx_data_ready=false;
-static float gmi30=0, gmi90=0;          // estimated A1C (GMI %) over 30/90 days
+static float gmi30=0, gmi90=0;          // GMI (%) over 30/90 days
 static volatile bool gmi_ready=false;
 struct FcDay { char dow[4]; int code, hi, lo; bool valid; };
 static FcDay forecast[4] = {};          // next 4 days (shared, dataMutex)
@@ -684,7 +685,7 @@ void mqttPublishDiscovery(){
     sensor("glucose","Glucose","mg/dL","{{ value_json.glucose }}","mdi:diabetes");
     sensor("trend","Glucose Trend","","{{ value_json.trend }}","mdi:trending-up");
     sensor("delta","Glucose Delta","mg/dL","{{ value_json.delta }}","mdi:delta");
-    sensor("gmi","GMI (est-A1C)","%","{{ value_json.gmi }}","mdi:water-percent");
+    sensor("gmi","GMI","%","{{ value_json.gmi }}","mdi:water-percent");
     mqttDiscoverySent=true;
     Serial.println("[MQTT] HA discovery published");
 }
@@ -738,9 +739,25 @@ void mqttEnsure(){            // every ~1s from fetchTask (Core 0): keepalive + 
 static volatile bool otaRequested=false;
 static String otaStatus="idle";
 
+// TLS validation needs a sane clock: the boot clock is 1970, which makes every
+// certificate "not yet valid" and would turn CA pinning into a permanent OTA
+// brick. One SNTP sync per boot before the first OTA handshake; cached after.
+// On sync failure OTA reports and skips — it never falls back to unverified TLS.
+static bool otaClockSynced=false;
+static bool otaSyncClock(){
+    if(otaClockSynced) return true;
+    configTime(0,0,"pool.ntp.org","time.google.com");
+    for(int i=0;i<20 && time(nullptr)<1700000000;i++) delay(500);   // <=10s wait
+    otaClockSynced = time(nullptr)>=1700000000;
+    if(!otaClockSynced) Serial.println("[OTA] clock sync failed — update skipped");
+    return otaClockSynced;
+}
+
 String otaFetchManifest(String& binUrl){
-    WiFiClientSecure c; c.setInsecure();
+    if(!otaSyncClock()){otaStatus="clock sync failed"; return "";}
+    WiFiClientSecure c; c.setCACert(OTA_ROOT_CAS);
     HTTPClient h; h.setConnectTimeout(8000); h.setTimeout(8000);
+    h.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if(!h.begin(c, OTA_MANIFEST_URL)) return "";
     String ver="";
     if(h.GET()==200){
@@ -759,7 +776,11 @@ void otaRunUpdate(){          // Core 0 (fetchTask) ONLY — blocking; reboots o
     if(binUrl.length()==0){otaStatus="newer version, no url"; return;}
     otaStatus="updating "+String(FW_VERSION)+" -> "+latest;
     Serial.printf("[OTA] %s -> %s : %s\n",FW_VERSION,latest.c_str(),binUrl.c_str());
-    WiFiClientSecure uc; uc.setInsecure();
+    // Same pinned roots for the binary itself. The release URL 302s from
+    // github.com (Sectigo chain) to objects.githubusercontent.com (Let's
+    // Encrypt chain) — both roots are in the bundle, and every hop validates.
+    WiFiClientSecure uc; uc.setCACert(OTA_ROOT_CAS);
+    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     httpUpdate.rebootOnUpdate(true);
     // The image we are about to boot must start with a clean crash slate. Without this, a
     // safe-mode pull reboots into the fix with crashes>=3 still in NVS, so the perfectly
@@ -801,7 +822,7 @@ void fetchTask(void*p){
         if(now-nNS>=NS_UPDATE_MS){nNS=now;fetchGlucose();mqttPublishState();}
         if(now-nOTA>=OTA_CHECK_MS){nOTA=now;otaRunUpdate();}
         if(now-nWX>=WEATHER_UPDATE_MS){nWX=now;fetchWeather();}
-        // GMI (est-A1C) only for Nightscout: first ~15s after boot, then hourly
+        // GMI only for Nightscout: first ~15s after boot, then hourly
         if(cfg.cgmSource==0){
             if(!gmiInit){if(now-taskStart>=15000){gmiInit=true;nGMI=now;fetchGMI();}}
             else if(now-nGMI>=GMI_UPDATE_MS){nGMI=now;fetchGMI();}

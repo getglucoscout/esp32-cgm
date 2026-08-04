@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0-rc2",
-  "url": "https://github.com/getglucoscout/esp32-cgm/releases/download/v1.0.0-rc2/CGM_Dashboard-s3.bin",
-  "notes": "OTA recovery ladder: auto-rollback on a boot-looping update, safe-mode self-recovery over WiFi"
+  "version": "1.0.0-rc3",
+  "url": "https://github.com/getglucoscout/esp32-cgm/releases/download/v1.0.0-rc3/CGM_Dashboard-s3.bin",
+  "notes": "OTA transport is certificate-pinned with an SNTP clock sync, and the Home Assistant sensor is now plain GMI."
 }

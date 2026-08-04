@@ -1,1 +1,6 @@
-{"version":"1.0.0-rc1","board":"esp32-p4/guition-10.1in","url":"https://github.com/getglucoscout/esp32-cgm/releases/latest/download/esp32-p4-guition-10.1in.bin","notes":"ESP32-P4 10.1in panel RC1"}
+{
+"version":"1.1.1",
+"board":"esp32-p4/guition-10.1in",
+"url":"https://github.com/getglucoscout/esp32-cgm/releases/download/p4-v1.1.1/esp32-p4-guition-10.1in.bin",
+"notes":"Update checks repaired (new repository home) and a Home Assistant fan message can no longer reboot the panel."
+}

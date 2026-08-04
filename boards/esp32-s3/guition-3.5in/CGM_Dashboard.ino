@@ -1722,6 +1722,68 @@ void handleSave(){
     else configServer.send(400,"text/plain","No valid parameters");
 }
 
+// --- /screenshot : the panel's own framebuffer, as a BMP -----------------------
+// Photographing this screen is a losing game: the camera sensor grid beats against
+// the LCD pixel grid (moiré), the glass mirrors the room, and a bright panel in a
+// dark room blows out. None of that is fixable in software after the fact. Pulling
+// the framebuffer straight out of LVGL sidesteps all three — these bytes ARE what
+// the panel is drawing, so docs and screenshots can never drift from the firmware.
+// Buffer comes from PSRAM explicitly (this board fragments its internal heap), and
+// is freed before returning. LVGL runs on the display task, so take the lock.
+void handleScreenshot(){
+    lv_obj_t *scr = lv_scr_act();
+    uint32_t need = lv_snapshot_buf_size_needed(scr, LV_IMG_CF_TRUE_COLOR);
+    if(!need){ configServer.send(500,"text/plain","snapshot: size unknown"); return; }
+    uint8_t *buf = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+    if(!buf){ configServer.send(507,"text/plain","snapshot: out of PSRAM"); return; }
+
+    lv_img_dsc_t dsc;
+    bool ok = false;
+    if(bsp_display_lock(1000)){
+        ok = (lv_snapshot_take_to_buf(scr, LV_IMG_CF_TRUE_COLOR, &dsc, buf, need) == LV_RES_OK);
+        bsp_display_unlock();
+    }
+    if(!ok){ free(buf); configServer.send(503,"text/plain","snapshot: display busy"); return; }
+
+    const int W = dsc.header.w, H = dsc.header.h;
+    const int rowb = W * 3, pad = (4 - (rowb & 3)) & 3;   // BMP rows are 4-byte aligned
+    const uint32_t px = (uint32_t)(rowb + pad) * H, total = 54 + px;
+
+    uint8_t hd[54] = {0};
+    hd[0]='B'; hd[1]='M';
+    hd[2]=total; hd[3]=total>>8; hd[4]=total>>16; hd[5]=total>>24;
+    hd[10]=54; hd[14]=40;
+    hd[18]=W; hd[19]=W>>8; hd[20]=W>>16;
+    hd[22]=H; hd[23]=H>>8; hd[24]=H>>16;
+    hd[26]=1; hd[28]=24;                                   // 1 plane, 24bpp
+    hd[34]=px; hd[35]=px>>8; hd[36]=px>>16; hd[37]=px>>24;
+
+    configServer.setContentLength(total);
+    configServer.send(200,"image/bmp","");
+    configServer.sendContent((const char*)hd, 54);
+
+    // RGB565 -> 24-bit BGR, one row at a time (bottom-up, as BMP expects)
+    static uint8_t row[480*3+3];
+    const uint16_t *src16 = (const uint16_t*)dsc.data;
+    for(int y = H-1; y >= 0; y--){
+        const uint16_t *s = src16 + (size_t)y * W;
+        for(int x = 0; x < W; x++){
+            uint16_t c = s[x];
+            // LV_COLOR_16_SWAP=1: the framebuffer is byte-swapped for this panel's
+            // QSPI controller, so undo that before unpacking RGB565.
+            c = (uint16_t)((c >> 8) | (c << 8));
+            row[x*3+0] = (uint8_t)(( c        & 0x1F) << 3);   // B
+            row[x*3+1] = (uint8_t)(((c >>  5) & 0x3F) << 2);   // G
+            row[x*3+2] = (uint8_t)(((c >> 11) & 0x1F) << 3);   // R
+        }
+        for(int p = 0; p < pad; p++) row[rowb+p] = 0;
+        configServer.sendContent((const char*)row, rowb + pad);
+    }
+    configServer.sendContent("", 0);
+    free(buf);
+    Serial.printf("[shot] served %dx%d BMP (%u bytes)\n", W, H, (unsigned)total);
+}
+
 void handleRestart(){configServer.send(200,"text/plain","Restarting...");delay(500);ESP.restart();}
 void handleFactoryReset(){
     configServer.send(200,"text/plain","Factory reset - erasing settings, rebooting into setup...");
@@ -1868,6 +1930,7 @@ void startConfigServer(){
     configServer.on("/otacheck", HTTP_POST, handleOtaCheck);
     configServer.on("/otastatus",HTTP_GET,  handleOtaStatus);
     configServer.on("/dbg",      HTTP_GET,  handleDbg);
+    configServer.on("/screenshot",HTTP_GET, handleScreenshot);
     configServer.on("/restart",  HTTP_POST, handleRestart);
     configServer.on("/factoryreset",HTTP_POST, handleFactoryReset);
     configServer.onNotFound(handleNotFound);

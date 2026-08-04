@@ -1,6 +1,6 @@
 {
-"version":"1.1.2",
+"version":"1.1.3",
 "board":"esp32-p4/guition-10.1in",
-"url":"https://github.com/getglucoscout/esp32-cgm/releases/download/p4-v1.1.2/esp32-p4-guition-10.1in.bin",
-"notes":"Settings shows WiFi and the panel address again; includes the 1.1.1 update-check and fan-crash fixes."
+"url":"https://github.com/getglucoscout/esp32-cgm/releases/download/p4-v1.1.3/esp32-p4-guition-10.1in.bin",
+"notes":"Settings shows the panel address on one line; stable MQTT for multi-panel setups."
 }
